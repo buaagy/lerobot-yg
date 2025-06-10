@@ -343,6 +343,9 @@ class OpenCVCamera:
         actual_width = self.camera.get(cv2.CAP_PROP_FRAME_WIDTH)
         actual_height = self.camera.get(cv2.CAP_PROP_FRAME_HEIGHT)
 
+        # 添加设置MJPG流;对于本产品配套的相机,在MJPG流模式下才能达到30fps@640*480
+        self.camera.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
+        
         # Using `math.isclose` since actual fps can be a float (e.g. 29.9 instead of 30)
         if self.fps is not None and not math.isclose(self.fps, actual_fps, rel_tol=1e-3):
             # Using `OSError` since it's a broad that encompasses issues related to device communication

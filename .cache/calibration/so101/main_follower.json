@@ -1,0 +1,53 @@
+{
+    "homing_offset": [
+        -2059,
+        3086,
+        -927,
+        -2053,
+        2006,
+        -2482
+    ],
+    "drive_mode": [
+        0,
+        1,
+        0,
+        0,
+        1,
+        0
+    ],
+    "start_pos": [
+        2083,
+        3097,
+        896,
+        2114,
+        2053,
+        2047
+    ],
+    "end_pos": [
+        3083,
+        -2062,
+        1951,
+        3077,
+        -982,
+        3506
+    ],
+    "calib_mode": [
+        "DEGREE",
+        "DEGREE",
+        "DEGREE",
+        "DEGREE",
+        "DEGREE",
+        "LINEAR"
+    ],
+    "motor_names": [
+        "shoulder_pan",
+        "shoulder_lift",
+        "elbow_flex",
+        "wrist_flex",
+        "wrist_roll",
+        "gripper"
+    ],
+    "robot_type": "so101",
+    "arm_name": "main_follower",
+    "serial_number": "R12252012"
+}
