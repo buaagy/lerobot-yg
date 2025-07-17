@@ -59,6 +59,28 @@ class OpenCVCameraConfig(CameraConfig):
         if self.rotation not in [-90, None, 90, 180]:
             raise ValueError(f"`rotation` must be in [-90, None, 90, 180] (got {self.rotation})")
 
+@CameraConfig.register_subclass("singlelinelidar")
+@dataclass
+class SingleLineLidarCameraConfig(CameraConfig):
+    camera_index: int
+    fps: int | None = None
+    width: int | None = None
+    height: int | None = None
+    color_mode: str = "gray"
+    channels: int | None = None
+    rotation: int | None = None
+    mock: bool = False
+
+    def __post_init__(self):
+        if self.color_mode not in ["gray"]:
+            raise ValueError(
+                f"`color_mode` is expected to be 'gray', but {self.color_mode} is provided."
+            )
+
+        self.channels = 1
+
+        if self.rotation not in [-90, None, 90, 180]:
+            raise ValueError(f"`rotation` must be in [-90, None, 90, 180] (got {self.rotation})")
 
 @CameraConfig.register_subclass("intelrealsense")
 @dataclass
