@@ -117,7 +117,9 @@ class OpenCVCamera(Camera):
         self.warmup_s = config.warmup_s
 
         self.videocapture: cv2.VideoCapture | None = None
-
+        # 将成员变量self.fourcc预先设置为MJPG
+        self.fourcc: cv2.VideoWriter_fourcc = cv2.VideoWriter_fourcc('M', 'J', 'P', 'G')
+        
         self.thread: Thread | None = None
         self.stop_event: Event | None = None
         self.frame_lock: Lock = Lock()
@@ -159,7 +161,7 @@ class OpenCVCamera(Camera):
         # blocking in multi-threaded applications, especially during data collection.
         cv2.setNumThreads(1)
 
-        self.videocapture = cv2.VideoCapture(self.index_or_path, self.backend)
+        self.videocapture = cv2.VideoCapture(self.index_or_path)
 
         if not self.videocapture.isOpened():
             self.videocapture.release()
@@ -199,12 +201,7 @@ class OpenCVCamera(Camera):
         """
         if not self.is_connected:
             raise DeviceNotConnectedError(f"Cannot configure settings for {self} as it is not connected.")
-
-        if self.fps is None:
-            self.fps = self.videocapture.get(cv2.CAP_PROP_FPS)
-        else:
-            self._validate_fps()
-
+        
         default_width = int(round(self.videocapture.get(cv2.CAP_PROP_FRAME_WIDTH)))
         default_height = int(round(self.videocapture.get(cv2.CAP_PROP_FRAME_HEIGHT)))
 
@@ -216,7 +213,15 @@ class OpenCVCamera(Camera):
                 self.capture_width, self.capture_height = default_width, default_height
         else:
             self._validate_width_and_height()
-
+            
+        # 设置相机编解码器为MJPG
+        self._validate_fourcc()
+        
+        if self.fps is None:
+            self.fps = self.videocapture.get(cv2.CAP_PROP_FPS)
+        else:
+            self._validate_fps()
+            
     def _validate_fps(self) -> None:
         """Validates and sets the camera's frames per second (FPS)."""
 
@@ -243,7 +248,19 @@ class OpenCVCamera(Camera):
             raise RuntimeError(
                 f"{self} failed to set capture_height={self.capture_height} ({actual_height=}, {height_success=})."
             )
-
+        
+    # 设置相机编解码器为MJPG
+    def _validate_fourcc(self) -> None:
+        """Validates and sets the camera's fourcc codec."""
+        
+        # 尝试将相机的编解码器设置为self.fourcc(预设值)
+        fourcc_succ = self.videocapture.set(cv2.CAP_PROP_FOURCC, self.fourcc)
+        # 获取相机当前实际使用的编解码器用于后续验证
+        actual_fourcc = self.videocapture.get(cv2.CAP_PROP_FOURCC)
+        # 如果设置失败或实际编解码器与预期不符,则抛出RuntimeError
+        if not fourcc_succ or actual_fourcc != self.fourcc:
+            raise RuntimeError(f"{self} failed to set fourcc={self.fourcc} ({actual_fourcc=}, {fourcc_succ=}).")
+        
     @staticmethod
     def find_cameras() -> list[dict[str, Any]]:
         """
