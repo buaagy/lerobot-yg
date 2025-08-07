@@ -57,6 +57,7 @@ class TrainPipelineConfig(HubMixin):
     log_freq: int = 200
     save_checkpoint: bool = True
     # Checkpoint is saved every `save_freq` training iterations and after the last training step.
+    # 每save_freq个迭代或者最后一个迭代时保存checkpoint
     save_freq: int = 20_000
     use_policy_training_preset: bool = True
     optimizer: OptimizerConfig | None = None

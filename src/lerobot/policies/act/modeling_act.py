@@ -148,19 +148,26 @@ class ACTPolicy(PreTrainedPolicy):
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
         """Run the batch through the model and compute the loss for training or validation."""
+        # 归一化
         batch = self.normalize_inputs(batch)
+        # 是否融合图像特征
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
             batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
-
+            
         batch = self.normalize_targets(batch)
+        
+        # 动作预测
         actions_hat, (mu_hat, log_sigma_x2_hat) = self.model(batch)
-
+        
+        # 计算L1损失(仅对非填充动作)
         l1_loss = (
             F.l1_loss(batch[ACTION], actions_hat, reduction="none") * ~batch["action_is_pad"].unsqueeze(-1)
         ).mean()
-
+        
         loss_dict = {"l1_loss": l1_loss.item()}
+        
+        # 计算KL散度
         if self.config.use_vae:
             # Calculate Dₖₗ(latent_pdf || standard_normal). Note: After computing the KL-divergence for
             # each dimension independently, we sum over the latent dimension to get the total
@@ -175,8 +182,8 @@ class ACTPolicy(PreTrainedPolicy):
             loss = l1_loss
 
         return loss, loss_dict
-
-
+    
+# 时间集成,temporal_ensemble_coeff默认值为0.01,更侧重旧的动作预测
 class ACTTemporalEnsembler:
     def __init__(self, temporal_ensemble_coeff: float, chunk_size: int) -> None:
         """Temporal ensembling as described in Algorithm 2 of https://huggingface.co/papers/2304.13705.
@@ -313,11 +320,13 @@ class ACT(nn.Module):
             self.vae_encoder = ACTEncoder(config, is_vae_encoder=True)
             self.vae_encoder_cls_embed = nn.Embedding(1, config.dim_model)
             # Projection layer for joint-space configuration to hidden dimension.
+            # joints是从1*14维通过线性层映射成1*512维的向量
             if self.config.robot_state_feature:
                 self.vae_encoder_robot_state_input_proj = nn.Linear(
                     self.config.robot_state_feature.shape[0], config.dim_model
                 )
             # Projection layer for action (joint-space target) to hidden dimension.
+            # actions是k*14维的张量，通过线形层映射成k*512维的张量
             self.vae_encoder_action_input_proj = nn.Linear(
                 self.config.action_feature.shape[0],
                 config.dim_model,
@@ -335,6 +344,7 @@ class ACT(nn.Module):
             )
 
         # Backbone for image feature extraction.
+        # 使用ResNet进行图像特征提取
         if self.config.image_features:
             backbone_model = getattr(torchvision.models, config.vision_backbone)(
                 replace_stride_with_dilation=[False, False, config.replace_final_stride_with_dilation],
@@ -681,8 +691,8 @@ class ACTDecoderLayer(nn.Module):
         if not self.pre_norm:
             x = self.norm3(x)
         return x
-
-
+    
+# 正弦位置编码
 def create_sinusoidal_pos_embedding(num_positions: int, dimension: int) -> Tensor:
     """1D sinusoidal positional embeddings as in Attention is All You Need.
 
@@ -753,8 +763,8 @@ class ACTSinusoidalPositionEmbedding2d(nn.Module):
         pos_embed = torch.cat((pos_embed_y, pos_embed_x), dim=3).permute(0, 3, 1, 2)  # (1, C, H, W)
 
         return pos_embed
-
-
+    
+# 获取激活函数
 def get_activation_fn(activation: str) -> Callable:
     """Return an activation function given a string."""
     if activation == "relu":
