@@ -95,6 +95,7 @@ class ACTConfig(PreTrainedConfig):
     chunk_size: int = 100
     n_action_steps: int = 100
 
+    # 均使用均值-标准差归一化方法
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
             "VISUAL": NormalizationMode.MEAN_STD,
@@ -110,19 +111,19 @@ class ACTConfig(PreTrainedConfig):
     replace_final_stride_with_dilation: int = False
     # Transformer layers.
     pre_norm: bool = False
-    dim_model: int = 512
+    dim_model: int = 512  # Transformer模型主维度
     n_heads: int = 8
-    dim_feedforward: int = 3200
+    dim_feedforward: int = 3200  # Transformer中前馈神经网络(FFN)中间层的维度
     feedforward_activation: str = "relu"
-    n_encoder_layers: int = 4
+    n_encoder_layers: int = 4  # Transformer encoder的层数
     # Note: Although the original ACT implementation has 7 for `n_decoder_layers`, there is a bug in the code
     # that means only the first layer is used. Here we match the original implementation by setting this to 1.
     # See this issue https://github.com/tonyzhaozh/act/issues/25#issue-2258740521.
-    n_decoder_layers: int = 1
+    n_decoder_layers: int = 1  # Transformer decoder实际只用了1层
     # VAE.
     use_vae: bool = True
-    latent_dim: int = 32
-    n_vae_encoder_layers: int = 4
+    latent_dim: int = 32  # 隐式变量(风格变量)的维度
+    n_vae_encoder_layers: int = 4  # VAE encoder的层数
 
     # Inference.
     # Note: the value used in ACT when temporal ensembling is enabled is 0.01.
@@ -137,24 +138,29 @@ class ACTConfig(PreTrainedConfig):
     optimizer_weight_decay: float = 1e-4
     optimizer_lr_backbone: float = 1e-5
 
+    # 输入校验
     def __post_init__(self):
         super().__post_init__()
 
         """Input validation (not exhaustive)."""
+        # 视觉backbone必须为resnet系列
         if not self.vision_backbone.startswith("resnet"):
             raise ValueError(
                 f"`vision_backbone` must be one of the ResNet variants. Got {self.vision_backbone}."
             )
+        # 如果使用时间集成(temporal ensembling),则需要n_action_steps=1
         if self.temporal_ensemble_coeff is not None and self.n_action_steps > 1:
             raise NotImplementedError(
                 "`n_action_steps` must be 1 when using temporal ensembling. This is "
                 "because the policy needs to be queried every step to compute the ensembled action."
             )
+        # n_action_steps 应该<= self.chunk_size
         if self.n_action_steps > self.chunk_size:
             raise ValueError(
                 f"The chunk size is the upper bound for the number of action steps per model invocation. Got "
                 f"{self.n_action_steps} for `n_action_steps` and {self.chunk_size} for `chunk_size`."
             )
+        # 目前只支持单步观测
         if self.n_obs_steps != 1:
             raise ValueError(
                 f"Multiple observation steps not handled yet. Got `nobs_steps={self.n_obs_steps}`"
@@ -168,7 +174,8 @@ class ACTConfig(PreTrainedConfig):
 
     def get_scheduler_preset(self) -> None:
         return None
-
+    
+    # 输入特征校验,必须提供至少一幅图像或者环境状态
     def validate_features(self) -> None:
         if not self.image_features and not self.env_state_feature:
             raise ValueError("You must provide at least one image or the environment state among the inputs.")

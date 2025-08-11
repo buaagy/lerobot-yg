@@ -61,9 +61,11 @@ class ACTPolicy(PreTrainedPolicy):
                 that they will be passed with a call to `load_state_dict` before the policy is used.
         """
         super().__init__(config)
+        # 输入特征校验,必须提供至少一幅图像或者环境状态
         config.validate_features()
         self.config = config
 
+        # 归一化
         self.normalize_inputs = Normalize(config.input_features, config.normalization_mapping, dataset_stats)
         self.normalize_targets = Normalize(
             config.output_features, config.normalization_mapping, dataset_stats
@@ -72,8 +74,10 @@ class ACTPolicy(PreTrainedPolicy):
             config.output_features, config.normalization_mapping, dataset_stats
         )
 
+        # 创建ACT模型
         self.model = ACT(config)
 
+        # 时间集成
         if config.temporal_ensemble_coeff is not None:
             self.temporal_ensembler = ACTTemporalEnsembler(config.temporal_ensemble_coeff, config.chunk_size)
 
@@ -157,7 +161,7 @@ class ACTPolicy(PreTrainedPolicy):
             
         batch = self.normalize_targets(batch)
         
-        # 动作预测
+        # 使用ACT模型进行动作预测
         actions_hat, (mu_hat, log_sigma_x2_hat) = self.model(batch)
         
         # 计算L1损失(仅对非填充动作)
@@ -316,11 +320,14 @@ class ACT(nn.Module):
         super().__init__()
         self.config = config
 
+        # 是否使用VAE encoder
         if self.config.use_vae:
+            # 创建ACT Encoder
             self.vae_encoder = ACTEncoder(config, is_vae_encoder=True)
+            # CLS是1*512维的可学习向量
             self.vae_encoder_cls_embed = nn.Embedding(1, config.dim_model)
             # Projection layer for joint-space configuration to hidden dimension.
-            # joints是从1*14维通过线性层映射成1*512维的向量
+            # joints是从1*14维通过线性层(nn.Linear)映射成1*512维的向量
             if self.config.robot_state_feature:
                 self.vae_encoder_robot_state_input_proj = nn.Linear(
                     self.config.robot_state_feature.shape[0], config.dim_model
@@ -357,11 +364,13 @@ class ACT(nn.Module):
             self.backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
 
         # Transformer (acts as VAE decoder when training with the variational objective).
+        # VAE decoder,包括一个Transformer encoder和一个Transformer decoder
         self.encoder = ACTEncoder(config)
         self.decoder = ACTDecoder(config)
 
         # Transformer encoder input projections. The tokens will be structured like
         # [latent, (robot_state), (env_state), (image_feature_map_pixels)].
+        # joints是从1*14维通过线性层(nn.Linear)映射成1*512维的向量
         if self.config.robot_state_feature:
             self.encoder_robot_state_input_proj = nn.Linear(
                 self.config.robot_state_feature.shape[0], config.dim_model
@@ -370,15 +379,19 @@ class ACT(nn.Module):
             self.encoder_env_state_input_proj = nn.Linear(
                 self.config.env_state_feature.shape[0], config.dim_model
             )
+        # 风格变量z,通过线性层从原始维度映射为1*512维
         self.encoder_latent_input_proj = nn.Linear(config.latent_dim, config.dim_model)
+        # 对于n幅图像，特征序列的维度则为n*300*512
         if self.config.image_features:
             self.encoder_img_feat_input_proj = nn.Conv2d(
                 backbone_model.fc.in_features, config.dim_model, kernel_size=1
             )
         # Transformer encoder positional embeddings.
         n_1d_tokens = 1  # for the latent
+        # 如果输入关节joints信息,则+1
         if self.config.robot_state_feature:
             n_1d_tokens += 1
+        # 如果输入环境状态信息,则再+1
         if self.config.env_state_feature:
             n_1d_tokens += 1
         self.encoder_1d_feature_pos_embed = nn.Embedding(n_1d_tokens, config.dim_model)
@@ -539,22 +552,27 @@ class ACT(nn.Module):
 
         return actions, (mu, log_sigma_x2)
 
-
+# ACT Encoder,兼容CVAE Encoder和Transformer Encoder,通过is_vae_encoder判断
 class ACTEncoder(nn.Module):
     """Convenience module for running multiple encoder layers, maybe followed by normalization."""
 
     def __init__(self, config: ACTConfig, is_vae_encoder: bool = False):
         super().__init__()
         self.is_vae_encoder = is_vae_encoder
+        # 确认层数,通过is_vae_encoder判断是CVAE Encoder还是Transformer Encoder,实际上两个默认值都是4
         num_layers = config.n_vae_encoder_layers if self.is_vae_encoder else config.n_encoder_layers
+        # 通过列表推导式创建包含num_layers个ACTEncoderLayer的序列,每层共享相同的config配置参数
         self.layers = nn.ModuleList([ACTEncoderLayer(config) for _ in range(num_layers)])
+        # 实现条件归一化层
         self.norm = nn.LayerNorm(config.dim_model) if config.pre_norm else nn.Identity()
 
     def forward(
         self, x: Tensor, pos_embed: Tensor | None = None, key_padding_mask: Tensor | None = None
     ) -> Tensor:
+        # 依次调用self.layers中的每个子层,逐步处理输入张量x
         for layer in self.layers:
             x = layer(x, pos_embed=pos_embed, key_padding_mask=key_padding_mask)
+        # 进行层归一化
         x = self.norm(x)
         return x
 
@@ -562,6 +580,7 @@ class ACTEncoder(nn.Module):
 class ACTEncoderLayer(nn.Module):
     def __init__(self, config: ACTConfig):
         super().__init__()
+        # 多头注意力
         self.self_attn = nn.MultiheadAttention(config.dim_model, config.n_heads, dropout=config.dropout)
 
         # Feed forward layers.
@@ -579,12 +598,14 @@ class ACTEncoderLayer(nn.Module):
 
     def forward(self, x, pos_embed: Tensor | None = None, key_padding_mask: Tensor | None = None) -> Tensor:
         skip = x
+        # 自注意力阶段
         if self.pre_norm:
             x = self.norm1(x)
         q = k = x if pos_embed is None else x + pos_embed
         x = self.self_attn(q, k, value=x, key_padding_mask=key_padding_mask)
         x = x[0]  # note: [0] to select just the output, not the attention weights
-        x = skip + self.dropout1(x)
+        x = skip + self.dropout1(x)  # 残差连接
+        # 前馈网络阶段
         if self.pre_norm:
             skip = x
             x = self.norm2(x)
@@ -592,7 +613,7 @@ class ACTEncoderLayer(nn.Module):
             x = self.norm1(x)
             skip = x
         x = self.linear2(self.dropout(self.activation(self.linear1(x))))
-        x = skip + self.dropout2(x)
+        x = skip + self.dropout2(x)  # 残差连接
         if not self.pre_norm:
             x = self.norm2(x)
         return x
@@ -602,6 +623,7 @@ class ACTDecoder(nn.Module):
     def __init__(self, config: ACTConfig):
         """Convenience module for running multiple decoder layers followed by normalization."""
         super().__init__()
+        # 通过列表推导式创建包含config.n_decoder_layers个ACTDecoderLayer的序列,每层共享相同的config配置参数
         self.layers = nn.ModuleList([ACTDecoderLayer(config) for _ in range(config.n_decoder_layers)])
         self.norm = nn.LayerNorm(config.dim_model)
 
@@ -612,10 +634,12 @@ class ACTDecoder(nn.Module):
         decoder_pos_embed: Tensor | None = None,
         encoder_pos_embed: Tensor | None = None,
     ) -> Tensor:
+        # 依次调用self.layers中的每个子层,逐步处理输入张量x
         for layer in self.layers:
             x = layer(
                 x, encoder_out, decoder_pos_embed=decoder_pos_embed, encoder_pos_embed=encoder_pos_embed
             )
+        # 进行层归一化
         if self.norm is not None:
             x = self.norm(x)
         return x
@@ -624,6 +648,7 @@ class ACTDecoder(nn.Module):
 class ACTDecoderLayer(nn.Module):
     def __init__(self, config: ACTConfig):
         super().__init__()
+        # 多头注意力
         self.self_attn = nn.MultiheadAttention(config.dim_model, config.n_heads, dropout=config.dropout)
         self.multihead_attn = nn.MultiheadAttention(config.dim_model, config.n_heads, dropout=config.dropout)
 

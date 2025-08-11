@@ -35,7 +35,7 @@ from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 from lerobot.policies.tdmpc.configuration_tdmpc import TDMPCConfig
 from lerobot.policies.vqbet.configuration_vqbet import VQBeTConfig
 
-
+# 根据policy名称返回policy class
 def get_policy_class(name: str) -> PreTrainedPolicy:
     """Get the policy's class and config class given a name (matching the policy class' `name` attribute)."""
     if name == "tdmpc":
@@ -100,7 +100,7 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
     else:
         raise ValueError(f"Policy type '{policy_type}' is not available.")
 
-
+# 创建一个policy的实例
 def make_policy(
     cfg: PreTrainedConfig,
     ds_meta: LeRobotDatasetMetadata | None = None,

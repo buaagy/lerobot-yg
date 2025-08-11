@@ -236,7 +236,8 @@ def record_loop(
 
         if policy is not None or dataset is not None:
             observation_frame = build_dataset_frame(dataset.features, observation, prefix="observation")
-
+            
+        # 通过policy预测action
         if policy is not None:
             action_values = predict_action(
                 observation_frame,
@@ -247,6 +248,7 @@ def record_loop(
                 robot_type=robot.robot_type,
             )
             action = {key: action_values[i].item() for i, key in enumerate(robot.action_features)}
+        # 遥操作
         elif policy is None and isinstance(teleop, Teleoperator):
             action = teleop.get_action()
         elif policy is None and isinstance(teleop, list):
