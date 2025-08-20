@@ -76,13 +76,13 @@ def assert_same_address(model_ctrl_table: dict[str, dict], motor_models: list[st
             f"({list(zip(motor_models, all_bytes, strict=False))})."
         )
 
-
+# 电机标准模式的枚举类
 class MotorNormMode(str, Enum):
     RANGE_0_100 = "range_0_100"
     RANGE_M100_100 = "range_m100_100"
     DEGREES = "degrees"
 
-
+# 电机标定参数的数据类
 @dataclass
 class MotorCalibration:
     id: int

@@ -44,8 +44,11 @@ class SO101Follower(Robot):
 
     def __init__(self, config: SO101FollowerConfig):
         super().__init__(config)
+        # 创建配置对象
         self.config = config
+        # body关节的标准电机模式
         norm_mode_body = MotorNormMode.DEGREES if config.use_degrees else MotorNormMode.RANGE_M100_100
+        # 创建飞特电机对象
         self.bus = FeetechMotorsBus(
             port=self.config.port,
             motors={
@@ -58,6 +61,7 @@ class SO101Follower(Robot):
             },
             calibration=self.calibration,
         )
+        # 根据相机配置字典,创建不同类型的相机对象
         self.cameras = make_cameras_from_configs(config.cameras)
 
     @property
@@ -89,7 +93,8 @@ class SO101Follower(Robot):
         """
         if self.is_connected:
             raise DeviceAlreadyConnectedError(f"{self} already connected")
-
+        
+        # 连接电机
         self.bus.connect()
         if not self.is_calibrated and calibrate:
             logger.info(
@@ -97,17 +102,20 @@ class SO101Follower(Robot):
             )
             self.calibrate()
 
+        # 连接相机
         for cam in self.cameras.values():
             cam.connect()
 
         self.configure()
         logger.info(f"{self} connected.")
-
+        
+    # 返回是否已经标定
     @property
     def is_calibrated(self) -> bool:
         return self.bus.is_calibrated
 
     def calibrate(self) -> None:
+        # 加载已有标定文件
         if self.calibration:
             # self.calibration is not empty here
             user_input = input(
@@ -117,21 +125,26 @@ class SO101Follower(Robot):
                 logger.info(f"Writing calibration file associated with the id {self.id} to the motors")
                 self.bus.write_calibration(self.calibration)
                 return
-
+            
+        # 自行标定
         logger.info(f"\nRunning calibration of {self}")
+        # 禁用电机扭矩
         self.bus.disable_torque()
         for motor in self.bus.motors:
             self.bus.write("Operating_Mode", motor, OperatingMode.POSITION.value)
 
+        # 步骤1:归零偏移量的标定
         input(f"Move {self} to the middle of its range of motion and press ENTER....")
         homing_offsets = self.bus.set_half_turn_homings()
 
+        # 步骤2:最大最小值的标定
         print(
             "Move all joints sequentially through their entire ranges "
             "of motion.\nRecording positions. Press ENTER to stop..."
         )
         range_mins, range_maxes = self.bus.record_ranges_of_motion()
 
+        # 将各电机的参数信息存储到字典中
         self.calibration = {}
         for motor, m in self.bus.motors.items():
             self.calibration[motor] = MotorCalibration(
@@ -142,47 +155,59 @@ class SO101Follower(Robot):
                 range_max=range_maxes[motor],
             )
 
+        # 写入标定数据,并保存标定文件
         self.bus.write_calibration(self.calibration)
         self._save_calibration()
         print("Calibration saved to", self.calibration_fpath)
 
+    # 电机配置,包括PID等参数
     def configure(self) -> None:
         with self.bus.torque_disabled():
             self.bus.configure_motors()
             for motor in self.bus.motors:
+                # 位置伺服模式
                 self.bus.write("Operating_Mode", motor, OperatingMode.POSITION.value)
                 # Set P_Coefficient to lower value to avoid shakiness (Default is 32)
                 self.bus.write("P_Coefficient", motor, 16)
                 # Set I_Coefficient and D_Coefficient to default value 0 and 32
                 self.bus.write("I_Coefficient", motor, 0)
+                # 减小D值,以减小机械臂抖动
                 self.bus.write("D_Coefficient", motor, 5)
 
+    # 设置各电机的ID
     def setup_motors(self) -> None:
         for motor in reversed(self.bus.motors):
             input(f"Connect the controller board to the '{motor}' motor only and press enter.")
             self.bus.setup_motor(motor)
             print(f"'{motor}' motor id set to {self.bus.motors[motor].id}")
 
+    # 获取观测数据
     def get_observation(self) -> dict[str, Any]:
+        # 确认已经连接
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
 
         # Read arm position
+        # 同步读取机械臂关节位置
         start = time.perf_counter()
         obs_dict = self.bus.sync_read("Present_Position")
+        # 机械臂位置数据统一添加.pos后缀
         obs_dict = {f"{motor}.pos": val for motor, val in obs_dict.items()}
         dt_ms = (time.perf_counter() - start) * 1e3
         logger.debug(f"{self} read state: {dt_ms:.1f}ms")
 
         # Capture images from cameras
+        # 异步采集相机图像
         for cam_key, cam in self.cameras.items():
             start = time.perf_counter()
             obs_dict[cam_key] = cam.async_read()
             dt_ms = (time.perf_counter() - start) * 1e3
             logger.debug(f"{self} read {cam_key}: {dt_ms:.1f}ms")
 
+        # 返回包含所有观测数据的字典
         return obs_dict
-
+    
+    # 命令机械臂移动到指定的目标关节配置位置
     def send_action(self, action: dict[str, Any]) -> dict[str, Any]:
         """Command arm to move to a target joint configuration.
 
@@ -196,22 +221,28 @@ class SO101Follower(Robot):
         Returns:
             the action sent to the motors, potentially clipped.
         """
+        # 确认已经连接
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
-
+        
+        # 动作指令解析
         goal_pos = {key.removesuffix(".pos"): val for key, val in action.items() if key.endswith(".pos")}
 
         # Cap goal position when too far away from present position.
         # /!\ Slower fps expected due to reading from the follower.
+        # 当目标位置与当前位置过远时,则对目标位置进行限制
         if self.config.max_relative_target is not None:
+            # 同步读取当前位置
             present_pos = self.bus.sync_read("Present_Position")
             goal_present_pos = {key: (g_pos, present_pos[key]) for key, g_pos in goal_pos.items()}
+            # 计算新的安全的目标位置
             goal_pos = ensure_safe_goal_position(goal_present_pos, self.config.max_relative_target)
 
         # Send goal position to the arm
         self.bus.sync_write("Goal_Position", goal_pos)
         return {f"{motor}.pos": val for motor, val in goal_pos.items()}
-
+    
+    # 断开连接
     def disconnect(self):
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")

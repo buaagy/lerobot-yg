@@ -46,7 +46,7 @@ MAX_OPENCV_INDEX = 60
 
 logger = logging.getLogger(__name__)
 
-
+# 支持查询相机/同步读取/异步读取等功能
 class OpenCVCamera(Camera):
     """
     Manages camera interactions using OpenCV for efficient frame recording.
@@ -261,6 +261,7 @@ class OpenCVCamera(Camera):
         if not fourcc_succ or actual_fourcc != self.fourcc:
             raise RuntimeError(f"{self} failed to set fourcc={self.fourcc} ({actual_fourcc=}, {fourcc_succ=}).")
         
+    # 查找相机
     @staticmethod
     def find_cameras() -> list[dict[str, Any]]:
         """
@@ -306,7 +307,8 @@ class OpenCVCamera(Camera):
                 camera.release()
 
         return found_cameras_info
-
+    
+    # 同步读取图像
     def read(self, color_mode: ColorMode | None = None) -> np.ndarray:
         """
         Reads a single frame synchronously from the camera.
@@ -346,7 +348,8 @@ class OpenCVCamera(Camera):
         logger.debug(f"{self} read took: {read_duration_ms:.1f}ms")
 
         return processed_frame
-
+    
+    # 后处理
     def _postprocess_image(self, image: np.ndarray, color_mode: ColorMode | None = None) -> np.ndarray:
         """
         Applies color conversion, dimension validation, and rotation to a raw frame.
@@ -373,23 +376,28 @@ class OpenCVCamera(Camera):
 
         h, w, c = image.shape
 
+        # 图像高度和宽度验证
         if h != self.capture_height or w != self.capture_width:
             raise RuntimeError(
                 f"{self} frame width={w} or height={h} do not match configured width={self.capture_width} or height={self.capture_height}."
             )
-
+        
+        # 图像通道数验证
         if c != 3:
             raise RuntimeError(f"{self} frame channels={c} do not match expected 3 channels (RGB/BGR).")
-
+        
+        # BGR转为RGB
         processed_image = image
         if requested_color_mode == ColorMode.RGB:
             processed_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
+        # 图像旋转
         if self.rotation in [cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE, cv2.ROTATE_180]:
             processed_image = cv2.rotate(processed_image, self.rotation)
 
         return processed_image
-
+    
+    # 循环读取图像,通过后台读取线程进行调用
     def _read_loop(self):
         """
         Internal loop run by the background thread for asynchronous reading.
@@ -403,10 +411,12 @@ class OpenCVCamera(Camera):
         """
         while not self.stop_event.is_set():
             try:
+                # 读取一帧图像
                 color_image = self.read()
-
+                # 保存为最新一帧图像
                 with self.frame_lock:
                     self.latest_frame = color_image
+                # 通知listeners
                 self.new_frame_event.set()
 
             except DeviceNotConnectedError:
@@ -414,6 +424,7 @@ class OpenCVCamera(Camera):
             except Exception as e:
                 logger.warning(f"Error reading frame in background thread for {self}: {e}")
 
+    # 开启后台读取线程
     def _start_read_thread(self) -> None:
         """Starts or restarts the background read thread if it's not running."""
         if self.thread is not None and self.thread.is_alive():
@@ -426,6 +437,7 @@ class OpenCVCamera(Camera):
         self.thread.daemon = True
         self.thread.start()
 
+    # 停止后台读取线程
     def _stop_read_thread(self) -> None:
         """Signals the background read thread to stop and waits for it to join."""
         if self.stop_event is not None:
@@ -436,7 +448,8 @@ class OpenCVCamera(Camera):
 
         self.thread = None
         self.stop_event = None
-
+        
+    # 异步读取图像
     def async_read(self, timeout_ms: float = 200) -> np.ndarray:
         """
         Reads the latest available frame asynchronously.
@@ -460,7 +473,8 @@ class OpenCVCamera(Camera):
         """
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
-
+        
+        # 开启读取线程
         if self.thread is None or not self.thread.is_alive():
             self._start_read_thread()
 
@@ -470,7 +484,8 @@ class OpenCVCamera(Camera):
                 f"Timed out waiting for frame from camera {self} after {timeout_ms} ms. "
                 f"Read thread alive: {thread_alive}."
             )
-
+        
+        # 获取最新一帧图像,互斥锁保护
         with self.frame_lock:
             frame = self.latest_frame
             self.new_frame_event.clear()

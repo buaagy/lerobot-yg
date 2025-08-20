@@ -23,16 +23,17 @@ from .configs import CameraConfig, Cv2Rotation
 
 IndexOrPath: TypeAlias = int | Path
 
-
+# 根据相机配置字典,创建不同类型的相机对象
 def make_cameras_from_configs(camera_configs: dict[str, CameraConfig]) -> dict[str, Camera]:
     cameras = {}
 
     for key, cfg in camera_configs.items():
+        # opencv支持的相机
         if cfg.type == "opencv":
             from .opencv import OpenCVCamera
-
+            
             cameras[key] = OpenCVCamera(cfg)
-
+        # realsense
         elif cfg.type == "intelrealsense":
             from .realsense.camera_realsense import RealSenseCamera
 
@@ -55,7 +56,7 @@ def get_cv2_rotation(rotation: Cv2Rotation) -> int | None:
     else:
         return None
 
-
+# 根据操作系统返回opencv的视频捕捉后端
 def get_cv2_backend() -> int:
     import cv2
 

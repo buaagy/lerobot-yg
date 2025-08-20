@@ -51,11 +51,13 @@ class OpenCVCameraConfig(CameraConfig):
         - Only 3-channel color output (RGB/BGR) is currently supported.
     """
 
+    # 相机ID或者视频文件路径
     index_or_path: int | Path
     color_mode: ColorMode = ColorMode.RGB
     rotation: Cv2Rotation = Cv2Rotation.NO_ROTATION
     warmup_s: int = 1
 
+    # 对象初始化后执行的额外逻辑
     def __post_init__(self):
         if self.color_mode not in (ColorMode.RGB, ColorMode.BGR):
             raise ValueError(

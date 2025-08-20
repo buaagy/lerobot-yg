@@ -78,6 +78,8 @@ class ACTPolicy(PreTrainedPolicy):
         self.model = ACT(config)
 
         # 时间集成
+        # self.config.temporal_ensemble_coeff = 0.01
+        print(f"{self.config.temporal_ensemble_coeff=}")
         if config.temporal_ensemble_coeff is not None:
             self.temporal_ensembler = ACTTemporalEnsembler(config.temporal_ensemble_coeff, config.chunk_size)
 
@@ -103,7 +105,7 @@ class ACTPolicy(PreTrainedPolicy):
                 "lr": self.config.optimizer_lr_backbone,
             },
         ]
-
+    
     def reset(self):
         """This should be called whenever the environment is reset."""
         if self.config.temporal_ensemble_coeff is not None:
@@ -119,13 +121,16 @@ class ACTPolicy(PreTrainedPolicy):
         environment. It works by managing the actions in a queue and only calling `select_actions` when the
         queue is empty.
         """
+        # 保持eval模式,关闭Dropout/batch normalization等训练特有的层,确保策略网络在评估时使用全局统计量而非批次统计
         self.eval()  # keeping the policy in eval mode as it could be set to train mode while queue is consumed
-
+        
+        # 使用时间集成的场合
         if self.config.temporal_ensemble_coeff is not None:
             actions = self.predict_action_chunk(batch)
             action = self.temporal_ensembler.update(actions)
             return action
-
+        
+        # 不使用时间集成的场合,当队列空时立即填充新动作
         # Action queue logic for n_action_steps > 1. When the action_queue is depleted, populate it by
         # querying the policy.
         if len(self._action_queue) == 0:
@@ -133,16 +138,21 @@ class ACTPolicy(PreTrainedPolicy):
 
             # `self.model.forward` returns a (batch_size, n_action_steps, action_dim) tensor, but the queue
             # effectively has shape (n_action_steps, batch_size, *), hence the transpose.
+            # 通过transpose(0, 1),将(batch_size, steps, action_dim)转为(steps, batch_size, action_dim)以适应队列结构
             self._action_queue.extend(actions.transpose(0, 1))
+        
+        # 返回1*6维的action
         return self._action_queue.popleft()
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
         """Predict a chunk of actions given environment observations."""
+        # 保持eval模式,关闭Dropout/batch normalization等训练特有的层
         self.eval()
 
         batch = self.normalize_inputs(batch)
         if self.config.image_features:
+            # 创建一个batch的浅拷贝,并将图像特征提取到OBS_IMAGES键中
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
             batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
 
@@ -370,22 +380,26 @@ class ACT(nn.Module):
 
         # Transformer encoder input projections. The tokens will be structured like
         # [latent, (robot_state), (env_state), (image_feature_map_pixels)].
-        # joints是从1*14维通过线性层(nn.Linear)映射成1*512维的向量
+        # joints是从1*6维通过线性层(nn.Linear)映射成1*512维的向量
         if self.config.robot_state_feature:
             self.encoder_robot_state_input_proj = nn.Linear(
                 self.config.robot_state_feature.shape[0], config.dim_model
             )
+            print(f"{self.config.robot_state_feature.shape=}")
+        # 环境状态
         if self.config.env_state_feature:
             self.encoder_env_state_input_proj = nn.Linear(
                 self.config.env_state_feature.shape[0], config.dim_model
             )
         # 风格变量z,通过线性层从原始维度映射为1*512维
         self.encoder_latent_input_proj = nn.Linear(config.latent_dim, config.dim_model)
+        print(f"{config.latent_dim=}")
         # 对于n幅图像，特征序列的维度则为n*300*512
         if self.config.image_features:
             self.encoder_img_feat_input_proj = nn.Conv2d(
                 backbone_model.fc.in_features, config.dim_model, kernel_size=1
             )
+            print(f"{backbone_model.fc.in_features=}")
         # Transformer encoder positional embeddings.
         n_1d_tokens = 1  # for the latent
         # 如果输入关节joints信息,则+1
@@ -437,6 +451,7 @@ class ACT(nn.Module):
                 "actions must be provided when using the variational objective in training mode."
             )
 
+        # 计算batch_size
         if "observation.images" in batch:
             batch_size = batch["observation.images"][0].shape[0]
         else:
