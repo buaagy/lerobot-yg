@@ -14,6 +14,7 @@
 
 """
 Helper to recalibrate your device (robot or teleoperator).
+标定机械臂或者遥操作装置
 
 Example:
 
@@ -72,8 +73,10 @@ def calibrate(cfg: CalibrateConfig):
     init_logging()
     logging.info(pformat(asdict(cfg)))
 
+    # 创建机械臂对象
     if isinstance(cfg.device, RobotConfig):
         device = make_robot_from_config(cfg.device)
+    # 创建遥操作对象
     elif isinstance(cfg.device, TeleoperatorConfig):
         device = make_teleoperator_from_config(cfg.device)
 

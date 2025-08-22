@@ -299,7 +299,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
     action_features = hw_to_dataset_features(robot.action_features, "action", cfg.dataset.video)
     obs_features = hw_to_dataset_features(robot.observation_features, "observation", cfg.dataset.video)
     dataset_features = {**action_features, **obs_features}
-
+    
+    # 恢复训练的场合
     if cfg.resume:
         dataset = LeRobotDataset(
             cfg.dataset.repo_id,
@@ -313,6 +314,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 num_threads=cfg.dataset.num_image_writer_threads_per_camera * len(robot.cameras),
             )
         sanity_check_dataset_robot_compatibility(dataset, robot, cfg.dataset.fps, dataset_features)
+    # 从头训练的场合
     else:
         # Create empty dataset or load existing saved episodes
         sanity_check_dataset_name(cfg.dataset.repo_id, cfg.policy)
@@ -331,15 +333,19 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
     # Load pretrained policy
     policy = None if cfg.policy is None else make_policy(cfg.policy, ds_meta=dataset.meta)
 
+    # 连接机械臂和遥控装置
     robot.connect()
     if teleop is not None:
         teleop.connect()
 
+    # 键盘listener
     listener, events = init_keyboard_listener()
 
     with VideoEncodingManager(dataset):
         recorded_episodes = 0
+        # 循环录制
         while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
+            # 开始录制
             log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
             record_loop(
                 robot=robot,
@@ -355,6 +361,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
             # Execute a few seconds without recording to give time to manually reset the environment
             # Skip reset for the last episode to be recorded
+            # 重置环境
             if not events["stop_recording"] and (
                 (recorded_episodes < cfg.dataset.num_episodes - 1) or events["rerecord_episode"]
             ):
@@ -369,6 +376,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     display_data=cfg.display_data,
                 )
 
+            # 重新录制上一个episode
             if events["rerecord_episode"]:
                 log_say("Re-record episode", cfg.play_sounds)
                 events["rerecord_episode"] = False
@@ -376,11 +384,13 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 dataset.clear_episode_buffer()
                 continue
 
+            # 保存数据
             dataset.save_episode()
             recorded_episodes += 1
 
     log_say("Stop recording", cfg.play_sounds, blocking=True)
 
+    # 断开机械臂和遥控装置的连接
     robot.disconnect()
     if teleop is not None:
         teleop.disconnect()
@@ -388,16 +398,17 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
     if not is_headless() and listener is not None:
         listener.stop()
 
+    # 推送到服务器
     if cfg.dataset.push_to_hub:
         dataset.push_to_hub(tags=cfg.dataset.tags, private=cfg.dataset.private)
 
     log_say("Exiting", cfg.play_sounds)
     return dataset
 
-
+# 主函数,执行record()函数
 def main():
     record()
 
-
+# 当脚本被直接运行时,__name__会被设置为__main__,此时会调用main()函数
 if __name__ == "__main__":
     main()

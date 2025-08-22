@@ -41,7 +41,7 @@ NORMALIZED_DATA = ["Goal_Position", "Present_Position"]
 
 logger = logging.getLogger(__name__)
 
-
+# 电机操作模式
 class OperatingMode(Enum):
     # position servo mode
     POSITION = 0
@@ -64,8 +64,8 @@ class DriveMode(Enum):
 class TorqueMode(Enum):
     ENABLED = 1
     DISABLED = 0
-
-
+    
+# 将整数按指定字节长度拆分成字节列表,用于与scservo_sdk(舵机sdk)交互时的数据转换
 def _split_into_byte_chunks(value: int, length: int) -> list[int]:
     import scservo_sdk as scs
 
@@ -269,14 +269,16 @@ class FeetechMotorsBus(MotorsBus):
             )
 
         return calibration
-
+    
+    # 将标定数据写入舵机
     def write_calibration(self, calibration_dict: dict[str, MotorCalibration], cache: bool = True) -> None:
         for motor, calibration in calibration_dict.items():
             if self.protocol_version == 0:
                 self.write("Homing_Offset", motor, calibration.homing_offset)
             self.write("Min_Position_Limit", motor, calibration.range_min)
             self.write("Max_Position_Limit", motor, calibration.range_max)
-
+        
+        # 缓存标定数据
         if cache:
             self.calibration = calibration_dict
 
@@ -284,6 +286,7 @@ class FeetechMotorsBus(MotorsBus):
         """
         On Feetech Motors:
         Present_Position = Actual_Position - Homing_Offset
+        对于飞特电机:当前位置=实际位置-零点偏移
         """
         half_turn_homings = {}
         for motor, pos in positions.items():

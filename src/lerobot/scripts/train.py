@@ -153,6 +153,7 @@ def train(cfg: TrainPipelineConfig):
     num_learnable_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
     num_total_params = sum(p.numel() for p in policy.parameters())
 
+    # 打印训练相关信息
     logging.info(colored("Output dir:", "yellow", attrs=["bold"]) + f" {cfg.output_dir}")
     if cfg.env is not None:
         logging.info(f"{cfg.env.task=}")
@@ -200,15 +201,20 @@ def train(cfg: TrainPipelineConfig):
     )
 
     logging.info("Start offline training on a fixed dataset")
+    # 循环训练cfg.steps步
     for _ in range(step, cfg.steps):
         start_time = time.perf_counter()
+        # 加载数据
         batch = next(dl_iter)
+        # 计算数据加载耗时
         train_tracker.dataloading_s = time.perf_counter() - start_time
 
+        # 将PyTorch张量批量转移到指定计算设备‌(如GPU)
         for key in batch:
             if isinstance(batch[key], torch.Tensor):
                 batch[key] = batch[key].to(device, non_blocking=device.type == "cuda")
 
+        # 更新策略
         train_tracker, output_dict = update_policy(
             train_tracker,
             policy,
@@ -222,12 +228,18 @@ def train(cfg: TrainPipelineConfig):
 
         # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
         # increment `step` here.
+        # 评估和checkpoint操作会在第step次训练更新‌完成后‌触发,因此先执行step+=1
         step += 1
+        # Updates metrics that depend on 'step' for one step
         train_tracker.step()
+        # 是否打印信息
         is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0
+        # 是否保存checkpoint
         is_saving_step = step % cfg.save_freq == 0 or step == cfg.steps
+        # 是否评估
         is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0
 
+        # 打印信息
         if is_log_step:
             logging.info(train_tracker)
             if wandb_logger:
@@ -237,6 +249,7 @@ def train(cfg: TrainPipelineConfig):
                 wandb_logger.log_dict(wandb_log_dict, step)
             train_tracker.reset_averages()
 
+        # 保存checkpoint
         if cfg.save_checkpoint and is_saving_step:
             logging.info(f"Checkpoint policy after step {step}")
             checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, step)
@@ -245,6 +258,7 @@ def train(cfg: TrainPipelineConfig):
             if wandb_logger:
                 wandb_logger.log_policy(checkpoint_dir)
 
+        # 评估
         if cfg.env and is_eval_step:
             step_id = get_step_identifier(step, cfg.steps)
             logging.info(f"Eval policy at step {step}")

@@ -14,7 +14,7 @@
 
 import numpy as np
 
-
+# 基于placo库的机械臂正向/逆向运动学
 class RobotKinematics:
     """Robot kinematics using placo library for forward and inverse kinematics."""
 
@@ -52,6 +52,7 @@ class RobotKinematics:
         # Initialize frame task for IK
         self.tip_frame = self.solver.add_frame_task(self.target_frame_name, np.eye(4))
 
+    # 正向运动学
     def forward_kinematics(self, joint_pos_deg):
         """
         Compute forward kinematics for given joint configuration given the target frame name in the constructor.
@@ -64,6 +65,7 @@ class RobotKinematics:
         """
 
         # Convert degrees to radians
+        # 将关节角度从‌度数转换为弧度,并截取与机器人关节名列表长度匹配的部分
         joint_pos_rad = np.deg2rad(joint_pos_deg[: len(self.joint_names)])
 
         # Update joint positions in placo robot
@@ -75,7 +77,8 @@ class RobotKinematics:
 
         # Get the transformation matrix
         return self.robot.get_T_world_frame(self.target_frame_name)
-
+    
+    # 逆向运动学
     def inverse_kinematics(
         self, current_joint_pos, desired_ee_pose, position_weight=1.0, orientation_weight=0.01
     ):
