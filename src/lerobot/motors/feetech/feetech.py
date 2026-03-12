@@ -17,9 +17,8 @@ from copy import deepcopy
 from enum import Enum
 from pprint import pformat
 
-from lerobot.motors.encoding_utils import decode_sign_magnitude, encode_sign_magnitude
-
-from ..motors_bus import Motor, MotorCalibration, MotorsBus, NameOrID, Value, get_address
+from ..encoding_utils import decode_sign_magnitude, encode_sign_magnitude
+from ..motors_bus import Motor, MotorCalibration, NameOrID, SerialMotorsBus, Value, get_address
 from .tables import (
     FIRMWARE_MAJOR_VERSION,
     FIRMWARE_MINOR_VERSION,
@@ -96,7 +95,7 @@ def patch_setPacketTimeout(self, packet_length):  # noqa: N802
     self.packet_timeout = (self.tx_time_per_byte * packet_length) + (self.tx_time_per_byte * 3.0) + 50
 
 
-class FeetechMotorsBus(MotorsBus):
+class FeetechMotorsBus(SerialMotorsBus):
     """
     The FeetechMotorsBus class allows to efficiently read and write to the attached motors. It relies on the
     python feetech sdk to communicate with the motors, which is itself based on the dynamixel sdk.
@@ -127,7 +126,7 @@ class FeetechMotorsBus(MotorsBus):
 
         self.port_handler = scs.PortHandler(self.port)
         # HACK: monkeypatch
-        self.port_handler.setPacketTimeout = patch_setPacketTimeout.__get__(
+        self.port_handler.setPacketTimeout = patch_setPacketTimeout.__get__(  # type: ignore[method-assign]
             self.port_handler, scs.PortHandler
         )
         self.packet_handler = scs.PacketHandler(protocol_version)
@@ -231,8 +230,12 @@ class FeetechMotorsBus(MotorsBus):
 
     @property
     def is_calibrated(self) -> bool:
+        if not self.calibration:
+            print("Calibration file not found!")
+            return False
         motors_calibration = self.read_calibration()
         if set(motors_calibration) != set(self.calibration):
+            print("Calibration joints mismatch!")
             return False
 
         same_ranges = all(
@@ -241,12 +244,35 @@ class FeetechMotorsBus(MotorsBus):
             for motor, cal in motors_calibration.items()
         )
         if self.protocol_version == 1:
+            if not same_ranges:
+                print("Calibration ranges mismatch!")
             return same_ranges
 
-        same_offsets = all(
-            self.calibration[motor].homing_offset == cal.homing_offset
-            for motor, cal in motors_calibration.items()
-        )
+        # Check homing_offset only for motors that are NOT in continuous rotation mode (VELOCITY mode)
+        # For continuous rotation motors like base wheels, homing_offset is not meaningful
+        same_offsets = True
+        for motor, cal in motors_calibration.items():
+            try:
+                # Read the Operating_Mode to check if motor is in continuous rotation mode
+                operating_mode = self.read("Operating_Mode", motor, normalize=False)
+                # Skip homing_offset check for VELOCITY mode (continuous rotation)
+                if operating_mode == OperatingMode.VELOCITY.value:
+                    continue
+                # For non-velocity mode motors, check homing_offset
+                if self.calibration[motor].homing_offset != cal.homing_offset:
+                    same_offsets = False
+                    print(f"Calibration offset mismatch for {motor} (not in continuous rotation mode)!")
+                    print(f"  Expected: {self.calibration[motor].homing_offset}, Got: {cal.homing_offset}")
+            except Exception as e:
+                # If we can't read Operating_Mode, fall back to checking homing_offset
+                # This maintains backward compatibility
+                logger.warning(f"Could not read Operating_Mode for {motor}: {e}. Checking homing_offset anyway.")
+                if self.calibration[motor].homing_offset != cal.homing_offset:
+                    same_offsets = False
+                    print(f"motor: {motor}, self.calibration[motor].homing_offset: {self.calibration[motor].homing_offset}, cal.homing_offset: {cal.homing_offset}")
+        
+        if not same_offsets:
+            print("Calibration offsets mismatch!")
         return same_ranges and same_offsets
 
     def read_calibration(self) -> dict[str, MotorCalibration]:
@@ -263,9 +289,9 @@ class FeetechMotorsBus(MotorsBus):
             calibration[motor] = MotorCalibration(
                 id=m.id,
                 drive_mode=0,
-                homing_offset=offsets[motor],
-                range_min=mins[motor],
-                range_max=maxes[motor],
+                homing_offset=int(offsets[motor]),
+                range_min=int(mins[motor]),
+                range_max=int(maxes[motor]),
             )
 
         return calibration
@@ -285,26 +311,47 @@ class FeetechMotorsBus(MotorsBus):
         On Feetech Motors:
         Present_Position = Actual_Position - Homing_Offset
         """
-        half_turn_homings = {}
+        half_turn_homings: dict[NameOrID, Value] = {}
         for motor, pos in positions.items():
             model = self._get_motor_model(motor)
             max_res = self.model_resolution_table[model] - 1
-            half_turn_homings[motor] = pos - int(max_res / 2)
+            
+            # calculate target offset
+            target_offset = pos - int(max_res / 2)
+            # print(f"target_offset: {target_offset}")
+            
+            # get Homing_Offset bits from encoding table
+            encoding_table = self.model_encoding_table.get(model, {})
+            homing_offset_bits = encoding_table.get("Homing_Offset", 11)  # 默认11位
+            
+            # calculate adjustment value: 2^(bits + 1)
+            adjustment_value = 1 << (homing_offset_bits + 1)
+            max_offset = (1 << homing_offset_bits) - 1  # 2^bits - 1
+            
+            # ensure offset is in reasonable range
+            # if out of range, adjust by adjustment_value
+            while target_offset > max_offset:
+                target_offset -= adjustment_value
+            while target_offset < -max_offset:
+                target_offset += adjustment_value
+            # print(f"target_offset adjusted: {target_offset}")
+            
+            half_turn_homings[motor] = target_offset
 
         return half_turn_homings
 
-    def disable_torque(self, motors: str | list[str] | None = None, num_retry: int = 0) -> None:
+    def disable_torque(self, motors: int | str | list[str] | None = None, num_retry: int = 0) -> None:
         for motor in self._get_motors_list(motors):
             self.write("Torque_Enable", motor, TorqueMode.DISABLED.value, num_retry=num_retry)
             self.write("Lock", motor, 0, num_retry=num_retry)
 
-    def _disable_torque(self, motor_id: int, model: str, num_retry: int = 0) -> None:
+    def _disable_torque(self, motor: int, model: str, num_retry: int = 0) -> None:
         addr, length = get_address(self.model_ctrl_table, model, "Torque_Enable")
-        self._write(addr, length, motor_id, TorqueMode.DISABLED.value, num_retry=num_retry)
+        self._write(addr, length, motor, TorqueMode.DISABLED.value, num_retry=num_retry)
         addr, length = get_address(self.model_ctrl_table, model, "Lock")
-        self._write(addr, length, motor_id, 0, num_retry=num_retry)
+        self._write(addr, length, motor, 0, num_retry=num_retry)
 
-    def enable_torque(self, motors: str | list[str] | None = None, num_retry: int = 0) -> None:
+    def enable_torque(self, motors: int | str | list[str] | None = None, num_retry: int = 0) -> None:
         for motor in self._get_motors_list(motors):
             self.write("Torque_Enable", motor, TorqueMode.ENABLED.value, num_retry=num_retry)
             self.write("Lock", motor, 1, num_retry=num_retry)
@@ -335,7 +382,7 @@ class FeetechMotorsBus(MotorsBus):
     def _broadcast_ping(self) -> tuple[dict[int, int], int]:
         import scservo_sdk as scs
 
-        data_list = {}
+        data_list: dict[int, int] = {}
 
         status_length = 6
 
@@ -415,7 +462,7 @@ class FeetechMotorsBus(MotorsBus):
         if not self._is_comm_success(comm):
             if raise_on_error:
                 raise ConnectionError(self.packet_handler.getTxRxResult(comm))
-            return
+            return None
 
         ids_errors = {id_: status for id_, status in ids_status.items() if self._is_error(status)}
         if ids_errors:

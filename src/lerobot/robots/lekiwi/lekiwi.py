@@ -152,7 +152,7 @@ class LeKiwi(Robot):
         homing_offsets.update(dict.fromkeys(self.base_motors, 0))
 
         full_turn_motor = [
-            motor for motor in motors if any(keyword in motor for keyword in ["wheel", "wrist_roll"])
+            motor for motor in motors if any(keyword in motor for keyword in ["wheel"])
         ]
         unknown_range_motors = [motor for motor in motors if motor not in full_turn_motor]
 
@@ -360,7 +360,7 @@ class LeKiwi(Robot):
         # Capture images from cameras
         for cam_key, cam in self.cameras.items():
             start = time.perf_counter()
-            obs_dict[cam_key] = cam.async_read()
+            obs_dict[cam_key] = cam.read_latest()
             dt_ms = (time.perf_counter() - start) * 1e3
             logger.debug(f"{self} read {cam_key}: {dt_ms:.1f}ms")
 
