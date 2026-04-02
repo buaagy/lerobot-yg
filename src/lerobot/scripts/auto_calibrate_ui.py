@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 
 """PyQt-based UI for SO auto calibration."""
 
@@ -20,6 +20,8 @@ from lerobot.motors.auto_calibrate import (
     auto_calibrate_connected_device,
     explore_literal_limit,
     get_joint_behavior,
+    is_calibration_paused,
+    set_calibration_paused,
 )
 from lerobot.motors.feetech import OperatingMode
 from lerobot.robots import make_robot_from_config, so_follower  # noqa: F401
@@ -118,13 +120,14 @@ AUTO_CALIBRATION_DEFAULTS = {
 STATUS_IDLE = "空闲中"
 STATUS_PORT_DETECTED = "检测到有外接端口"
 STATUS_CALIBRATING = "标定中"
+STATUS_PAUSED = "标定已暂停"
 STATUS_FINISHED = "标定完毕，请拔掉USB"
 STATUS_FAILED = "标定失败"
 STATUS_AUTHORIZING = "端口授权中"
 STATUS_CHECKING_ARM = "机械臂检测中"
 
 ACTIVE_STATUSES = {STATUS_IDLE, STATUS_PORT_DETECTED}
-BUSY_STATUSES = {STATUS_CALIBRATING, STATUS_AUTHORIZING, STATUS_CHECKING_ARM}
+BUSY_STATUSES = {STATUS_CALIBRATING, STATUS_PAUSED, STATUS_AUTHORIZING, STATUS_CHECKING_ARM}
 TERMINAL_STATUSES = {STATUS_FINISHED, STATUS_FAILED}
 
 
@@ -394,14 +397,15 @@ class AutoCalibrateWindow(QMainWindow):
 
         self.port_combo = QComboBox()
         self.port_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.port_combo.currentIndexChanged.connect(self.update_action_buttons)
+        self.port_combo.currentIndexChanged.connect(self.on_port_changed)
 
         self.refresh_button = QPushButton("刷新串口")
+        self.refresh_button.setObjectName("secondaryButton")
         self.refresh_button.clicked.connect(self.refresh_ports)
 
         self.filename_input = QLineEdit("my_so101")
         self.filename_input.setPlaceholderText("例如：tele_calibration 或 robot_01.json")
-        self.filename_input.textChanged.connect(self.update_action_buttons)
+        self.filename_input.textChanged.connect(self.on_filename_changed)
 
         filename_hint = QLabel("只修改文件名，不修改保存目录。最终仍保存到设备默认 calibration 路径。")
         filename_hint.setObjectName("hintLabel")
@@ -434,7 +438,7 @@ class AutoCalibrateWindow(QMainWindow):
         info_layout.addWidget(self.status_badge)
         info_layout.addWidget(self.status_detail_label)
 
-        self.output_hint_label = QLabel("输出文件：未生成")
+        self.output_hint_label = QLabel("输出路径：未生成")
         self.output_hint_label.setWordWrap(True)
         self.output_hint_label.setObjectName("outputHintLabel")
 
@@ -453,17 +457,25 @@ class AutoCalibrateWindow(QMainWindow):
         self.start_button.setObjectName("primaryButton")
         self.start_button.clicked.connect(self.start_calibration)
 
+        self.pause_button = QPushButton("暂停标定")
+        self.pause_button.setObjectName("pauseButton")
+        self.pause_button.clicked.connect(self.toggle_pause_calibration)
+
         self.recalibrate_button = QPushButton("重新标定")
+        self.recalibrate_button.setObjectName("secondaryButton")
         self.recalibrate_button.clicked.connect(self.restart_calibration)
 
         self.arm_check_button = QPushButton("检测机械臂")
+        self.arm_check_button.setObjectName("secondaryButton")
         self.arm_check_button.clicked.connect(self.start_arm_check)
 
         self.permission_button = QPushButton("Linux 端口授权")
+        self.permission_button.setObjectName("secondaryButton")
         self.permission_button.clicked.connect(self.grant_linux_permissions)
         self.permission_button.setVisible(IS_LINUX)
 
         button_layout.addWidget(self.start_button)
+        button_layout.addWidget(self.pause_button)
         button_layout.addWidget(self.recalibrate_button)
         button_layout.addWidget(self.arm_check_button)
         if IS_LINUX:
@@ -482,6 +494,7 @@ class AutoCalibrateWindow(QMainWindow):
 
         self.append_log(f"UI 已启动，正在检测本机可用串口。当前图形库：{QT_LIB}")
         self.update_action_buttons()
+        self.update_output_preview()
 
     def _apply_styles(self):
         self.setStyleSheet(
@@ -529,16 +542,18 @@ class AutoCalibrateWindow(QMainWindow):
                 border: 1px solid #1f8a70;
             }
             QPushButton {
-                background: #ffffff;
+                background: #fffaf4;
                 font-weight: 600;
+                color: #344054;
             }
             QPushButton:hover {
                 border: 1px solid #1f8a70;
+                background: #f5efe6;
             }
             QPushButton:disabled {
-                background: #ece8e0;
-                color: #9aa5ad;
-                border: 1px solid #d8d1c8;
+                background: #ddd6cb;
+                color: #8a847a;
+                border: 1px solid #c7beb3;
             }
             QPushButton#primaryButton {
                 background: #1f8a70;
@@ -547,6 +562,39 @@ class AutoCalibrateWindow(QMainWindow):
             }
             QPushButton#primaryButton:hover {
                 background: #19715c;
+            }
+            QPushButton#primaryButton:disabled {
+                background: #9fcabc;
+                color: #eef7f3;
+                border: 1px solid #9fcabc;
+            }
+            QPushButton#pauseButton {
+                background: #fff3e8;
+                color: #9a3412;
+                border: 1px solid #fdba74;
+            }
+            QPushButton#pauseButton:hover {
+                background: #ffedd5;
+                border: 1px solid #fb923c;
+            }
+            QPushButton#pauseButton:disabled {
+                background: #f1e3d5;
+                color: #b9a18d;
+                border: 1px solid #e3d1bf;
+            }
+            QPushButton#secondaryButton {
+                background: #f8f5ef;
+                color: #475467;
+                border: 1px solid #d7cec2;
+            }
+            QPushButton#secondaryButton:hover {
+                background: #f1ece4;
+                border: 1px solid #b9ab98;
+            }
+            QPushButton#secondaryButton:disabled {
+                background: #e7e1d8;
+                color: #9b948a;
+                border: 1px solid #d1c8bc;
             }
             QFrame#infoCard {
                 background: qlineargradient(
@@ -601,6 +649,7 @@ class AutoCalibrateWindow(QMainWindow):
             STATUS_IDLE: "#6b7280",
             STATUS_PORT_DETECTED: "#1d7a5f",
             STATUS_CALIBRATING: "#a05a00",
+            STATUS_PAUSED: "#b45309",
             STATUS_FINISHED: "#0f766e",
             STATUS_FAILED: "#b42318",
             STATUS_AUTHORIZING: "#7c3aed",
@@ -616,6 +665,14 @@ class AutoCalibrateWindow(QMainWindow):
             "robot_calibration",
         }:
             self.filename_input.setText(suggested_name)
+        self.update_output_preview()
+        self.update_action_buttons()
+
+    def on_port_changed(self):
+        self.update_output_preview()
+        self.update_action_buttons()
+
+    def on_filename_changed(self):
         self.update_output_preview()
         self.update_action_buttons()
 
@@ -677,21 +734,43 @@ class AutoCalibrateWindow(QMainWindow):
             return ""
         return text if text.lower().endswith(".json") else f"{text}.json"
 
+    def resolve_output_path_preview(self) -> Path | None:
+        filename = self.normalized_filename()
+        port = self.selected_port()
+        if not filename or not port:
+            return None
+
+        try:
+            device_type = self.selected_device_type()
+            device_config = DEVICE_CONFIG_FACTORIES[device_type](port=port, id=Path(filename).stem or "my_so101")
+            device = DEVICE_FACTORIES[device_type](device_config)
+            return Path(device.calibration_fpath).with_name(filename)
+        except Exception:
+            return None
+
     def update_output_preview(self):
         filename = self.normalized_filename()
         if not filename:
-            self.output_hint_label.setText("输出文件：请先输入文件名")
+            self.output_hint_label.setText("输出路径：请先输入文件名")
             return
 
         if self.last_output_path:
             preview_path = Path(self.last_output_path).with_name(filename)
-            self.output_hint_label.setText(f"输出文件：{preview_path}")
+            self.output_hint_label.setText(f"输出路径：{preview_path}")
             return
 
-        self.output_hint_label.setText(f"输出文件：{filename} | 保存目录沿用设备默认 calibration 路径")
+        preview_path = self.resolve_output_path_preview()
+        if preview_path is not None:
+            self.output_hint_label.setText(f"输出路径：{preview_path}")
+            return
+
+        self.output_hint_label.setText(f"输出路径：{filename} | 连接设备后可显示完整保存位置")
 
     def can_start_calibration(self) -> bool:
         return bool(self.selected_port() and self.filename_input.text().strip())
+
+    def has_running_calibration(self) -> bool:
+        return isinstance(self.worker, CalibrationWorker)
 
     def start_worker(self, worker: WorkerBase):
         self.worker_thread = QThread(self)
@@ -712,8 +791,11 @@ class AutoCalibrateWindow(QMainWindow):
     def update_action_buttons(self):
         ready = self.can_start_calibration()
         is_busy = self.current_status in BUSY_STATUSES
+        has_running_calibration = self.has_running_calibration()
 
         self.start_button.setEnabled(ready and not is_busy and self.current_status in ACTIVE_STATUSES)
+        self.pause_button.setEnabled(has_running_calibration and self.current_status in {STATUS_CALIBRATING, STATUS_PAUSED})
+        self.pause_button.setText("继续标定" if is_calibration_paused() else "暂停标定")
         self.recalibrate_button.setEnabled(ready and not is_busy and self.current_status in TERMINAL_STATUSES)
         self.arm_check_button.setEnabled(bool(self.selected_port()) and not is_busy)
         self.refresh_button.setEnabled(not is_busy)
@@ -732,12 +814,26 @@ class AutoCalibrateWindow(QMainWindow):
         selected_type = self.selected_device_type()
         filename = self.filename_input.text().strip()
 
+        set_calibration_paused(False)
         self.append_log("")
         self.append_log("=" * 72)
         self.append_log(
             f"准备开始标定 | device_type={selected_type} | port={selected_port} | file={filename}"
         )
         self.start_worker(CalibrationWorker(selected_type, selected_port, filename))
+
+    def toggle_pause_calibration(self):
+        if not self.has_running_calibration():
+            return
+
+        if is_calibration_paused():
+            set_calibration_paused(False)
+            self.append_log("继续标定。")
+            self.set_status(STATUS_CALIBRATING, "标定已继续执行。")
+        else:
+            set_calibration_paused(True)
+            self.append_log("暂停标定，当前舵机保持锁住状态。")
+            self.set_status(STATUS_PAUSED, "标定已暂停，当前动作会安全停下，舵机保持锁住，等待继续。")
 
     def restart_calibration(self):
         self.append_log("收到重新标定请求，准备重新开始。")
@@ -782,10 +878,12 @@ class AutoCalibrateWindow(QMainWindow):
         self.append_log(message)
 
     def on_worker_failed(self, error_message: str):
-        self.append_log(f"操作失败：{error_message}")
-        QMessageBox.critical(self, "操作失败", error_message)
+        log_title, dialog_title = classify_worker_failure(self.worker)
+        self.append_log(f"{log_title}：{error_message}")
+        QMessageBox.critical(self, dialog_title, error_message)
 
     def on_worker_finished(self):
+        set_calibration_paused(False)
         self.worker = None
         self.worker_thread = None
         self.update_action_buttons()
