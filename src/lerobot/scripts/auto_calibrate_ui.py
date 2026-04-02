@@ -1,24 +1,34 @@
 #!/usr/bin/env python3
 
-"""PyQt-based UI for SO101 auto calibration."""
+"""PyQt-based UI for SO auto calibration."""
 
 from __future__ import annotations
 
+import glob
 import logging
+import os
+import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
 from serial.tools import list_ports
 
-from lerobot.motors.auto_calibrate import AutoCalibrateConfig, auto_calibrate_connected_device
+from lerobot.motors.auto_calibrate import (
+    AutoCalibrateConfig,
+    auto_calibrate_connected_device,
+    explore_literal_limit,
+    get_joint_behavior,
+)
+from lerobot.motors.feetech import OperatingMode
 from lerobot.robots import make_robot_from_config, so_follower  # noqa: F401
 from lerobot.robots.so_follower import SO101FollowerConfig
 from lerobot.teleoperators import make_teleoperator_from_config, so_leader  # noqa: F401
 from lerobot.teleoperators.so_leader import SO101LeaderConfig
 
 try:
-    from PyQt5.QtCore import QObject, QThread, QTimer, Qt, pyqtSignal as Signal
+    from PyQt5.QtCore import QObject, QThread, QTimer, pyqtSignal as Signal
     from PyQt5.QtGui import QColor, QFont, QTextCursor
     from PyQt5.QtWidgets import (
         QApplication,
@@ -27,6 +37,7 @@ try:
         QGridLayout,
         QGroupBox,
         QHBoxLayout,
+        QInputDialog,
         QLabel,
         QLineEdit,
         QMainWindow,
@@ -37,9 +48,10 @@ try:
         QVBoxLayout,
         QWidget,
     )
+
     QT_LIB = "PyQt5"
 except ImportError:
-    from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal
+    from PySide6.QtCore import QObject, QThread, QTimer, Signal
     from PySide6.QtGui import QColor, QFont, QTextCursor
     from PySide6.QtWidgets import (
         QApplication,
@@ -48,6 +60,7 @@ except ImportError:
         QGridLayout,
         QGroupBox,
         QHBoxLayout,
+        QInputDialog,
         QLabel,
         QLineEdit,
         QMainWindow,
@@ -58,10 +71,18 @@ except ImportError:
         QVBoxLayout,
         QWidget,
     )
+
     QT_LIB = "PySide6"
 
 
 logger = logging.getLogger(__name__)
+
+IS_WINDOWS = sys.platform.startswith("win")
+IS_LINUX = sys.platform.startswith("linux")
+LINUX_PORT_PREFIX = "/dev/ttyACM"
+
+GRIPPER_CHECK_TORQUE = 300
+GRIPPER_CHECK_VELOCITY = 300
 
 DEVICE_CONFIG_FACTORIES = {
     "tele": SO101LeaderConfig,
@@ -99,8 +120,11 @@ STATUS_PORT_DETECTED = "检测到有外接端口"
 STATUS_CALIBRATING = "标定中"
 STATUS_FINISHED = "标定完毕，请拔掉USB"
 STATUS_FAILED = "标定失败"
+STATUS_AUTHORIZING = "端口授权中"
+STATUS_CHECKING_ARM = "机械臂检测中"
 
 ACTIVE_STATUSES = {STATUS_IDLE, STATUS_PORT_DETECTED}
+BUSY_STATUSES = {STATUS_CALIBRATING, STATUS_AUTHORIZING, STATUS_CHECKING_ARM}
 TERMINAL_STATUSES = {STATUS_FINISHED, STATUS_FAILED}
 
 
@@ -124,16 +148,17 @@ class QtLogHandler(logging.Handler):
         self.emitter = LogEmitter()
 
     def emit(self, record: logging.LogRecord):
-        message = self.format(record)
-        self.emitter.message_emitted.emit(message)
+        self.emitter.message_emitted.emit(self.format(record))
 
 
-class CalibrationWorker(QObject):
+class WorkerBase(QObject):
     finished = Signal()
     succeeded = Signal(str)
     failed = Signal(str)
     status_changed = Signal(str, str)
 
+
+class CalibrationWorker(WorkerBase):
     def __init__(self, device_type: str, port: str, filename: str):
         super().__init__()
         self.device_type = device_type
@@ -165,7 +190,7 @@ class CalibrationWorker(QObject):
             )
 
             final_path = result.calibration_path or output_path
-            self.status_changed.emit(STATUS_FINISHED, f"标定完成，文件已保存到: {final_path}")
+            self.status_changed.emit(STATUS_FINISHED, f"标定完成，文件已保存到：{final_path}")
             self.succeeded.emit(str(final_path))
         except Exception as error:
             logger.exception("Auto calibration failed.")
@@ -181,26 +206,142 @@ class CalibrationWorker(QObject):
 
     @staticmethod
     def ensure_json_suffix(filename: str) -> str:
-        cleaned = filename.strip()
-        if not cleaned:
-            cleaned = "my_so101"
-        if cleaned.lower().endswith(".json"):
-            return cleaned
-        return f"{cleaned}.json"
+        cleaned = filename.strip() or "my_so101"
+        return cleaned if cleaned.lower().endswith(".json") else f"{cleaned}.json"
+
+
+class LinuxPermissionWorker(WorkerBase):
+    def __init__(self, password: str):
+        super().__init__()
+        self.password = password
+
+    def run(self):
+        try:
+            self.status_changed.emit(STATUS_AUTHORIZING, "正在给 /dev/ttyACM* 设置读写权限。")
+            matched_ports = sorted(glob.glob(f"{LINUX_PORT_PREFIX}*"))
+            if not matched_ports:
+                raise RuntimeError("未找到 /dev/ttyACM* 设备，请先连接机械臂。")
+
+            result = subprocess.run(
+                ["sudo", "-S", "/bin/sh", "-c", "chmod 666 /dev/ttyACM*"],
+                input=f"{self.password}\n",
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            if result.returncode != 0:
+                error = (result.stderr or result.stdout).strip()
+                raise RuntimeError(error or "端口授权失败，请确认密码是否正确。")
+
+            inaccessible = [port for port in matched_ports if not os.access(port, os.R_OK | os.W_OK)]
+            if inaccessible:
+                raise RuntimeError(f"以下端口仍不可读写：{', '.join(inaccessible)}")
+
+            message = f"端口授权成功：{', '.join(matched_ports)}"
+            self.status_changed.emit(STATUS_PORT_DETECTED, message)
+            self.succeeded.emit(message)
+        except Exception as error:
+            logger.exception("Failed to grant Linux port permissions.")
+            self.status_changed.emit(STATUS_FAILED, str(error))
+            self.failed.emit(str(error))
+        finally:
+            self.finished.emit()
+
+
+class ArmCheckWorker(WorkerBase):
+    def __init__(self, device_type: str, port: str):
+        super().__init__()
+        self.device_type = device_type
+        self.port = port
+
+    def run(self):
+        device = None
+        try:
+            self.status_changed.emit(STATUS_CHECKING_ARM, f"正在检测机械臂，端口：{self.port}")
+            device_config = DEVICE_CONFIG_FACTORIES[self.device_type](port=self.port, id="arm_check")
+            device = DEVICE_FACTORIES[self.device_type](device_config)
+            device.connect(calibrate=False)
+
+            bus = getattr(device, "bus", None)
+            if bus is None:
+                raise RuntimeError("当前设备未暴露 bus，无法执行机械臂检测。")
+
+            motor_name = self.find_gripper_motor_name(bus)
+            self.move_motor_to_limits(bus, motor_name)
+
+            message = f"{motor_name} 已完成双向边界检测。"
+            self.status_changed.emit(STATUS_PORT_DETECTED, message)
+            self.succeeded.emit(message)
+        except Exception as error:
+            logger.exception("Arm check failed.")
+            self.status_changed.emit(STATUS_FAILED, str(error))
+            self.failed.emit(str(error))
+        finally:
+            if device is not None:
+                try:
+                    device.disconnect()
+                except Exception:
+                    logger.exception("Failed to disconnect after arm check.")
+            self.finished.emit()
+
+    @staticmethod
+    def find_gripper_motor_name(bus) -> str:
+        if "gripper" in bus.motors:
+            return "gripper"
+        for motor_name, motor in bus.motors.items():
+            if getattr(motor, "id", None) == 6:
+                return motor_name
+        raise RuntimeError("未找到 6 号舵机或 gripper 电机。")
+
+    @staticmethod
+    def move_motor_to_limits(bus, motor_name: str):
+        original_mode = bus.read("Operating_Mode", motor_name, normalize=False)
+        original_torque_limit = bus.read("Torque_Limit", motor_name, normalize=False)
+        original_torque_enable = bus.read("Torque_Enable", motor_name, normalize=False)
+
+        behavior = get_joint_behavior(motor_name)
+        check_config = AutoCalibrateConfig(
+            robot=None,
+            try_torque=GRIPPER_CHECK_TORQUE,
+            max_torque=GRIPPER_CHECK_TORQUE,
+            torque_step=50,
+            explore_velocity=GRIPPER_CHECK_VELOCITY,
+            wait_time_s=0.2,
+            velocity_threshold=4,
+            position_tolerance=4000,
+        )
+
+        try:
+            bus.write("Operating_Mode", motor_name, OperatingMode.VELOCITY.value, normalize=False)
+            bus.write("Torque_Limit", motor_name, GRIPPER_CHECK_TORQUE, normalize=False)
+            bus.write("Torque_Enable", motor_name, 1, normalize=False)
+
+            logger.info("Arm check: exploring first limit for %s", motor_name)
+            explore_literal_limit(bus, motor_name, behavior.first_direction, check_config)
+            time.sleep(check_config.wait_time_s)
+            logger.info("Arm check: exploring reverse limit for %s", motor_name)
+            explore_literal_limit(bus, motor_name, behavior.second_direction, check_config)
+        finally:
+            try:
+                bus.write("Goal_Velocity", motor_name, 0, normalize=False)
+            finally:
+                bus.write("Operating_Mode", motor_name, original_mode, normalize=False)
+                bus.write("Torque_Limit", motor_name, original_torque_limit, normalize=False)
+                bus.write("Torque_Enable", motor_name, original_torque_enable, normalize=False)
 
 
 class AutoCalibrateWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.worker_thread: QThread | None = None
-        self.worker: CalibrationWorker | None = None
+        self.worker: WorkerBase | None = None
         self.current_status = STATUS_IDLE
         self.last_output_path = ""
         self._log_handler: QtLogHandler | None = None
 
-        self.setWindowTitle("SO101 Auto Calibrate")
-        self.resize(980, 720)
-        self.setMinimumSize(900, 640)
+        self.setWindowTitle("SO 自动标定")
+        self.resize(1040, 760)
+        self.setMinimumSize(920, 680)
 
         self._setup_logging()
         self._build_ui()
@@ -211,7 +352,6 @@ class AutoCalibrateWindow(QMainWindow):
     def _setup_logging(self):
         root_logger = logging.getLogger()
         root_logger.setLevel(logging.INFO)
-
         self._log_handler = QtLogHandler()
         self._log_handler.setFormatter(
             logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s", "%H:%M:%S")
@@ -230,7 +370,9 @@ class AutoCalibrateWindow(QMainWindow):
         header_layout = QVBoxLayout()
         title_label = QLabel("自动标定控制台")
         title_label.setObjectName("titleLabel")
-        subtitle_label = QLabel(f"基于 {QT_LIB} 的 SO101 标定页面，支持日志输出、串口检测和重新标定。")
+        subtitle_label = QLabel(
+            f"基于 {QT_LIB} 的标定页面，支持串口检测、Linux 端口授权、机械臂检测和自动标定。"
+        )
         subtitle_label.setObjectName("subtitleLabel")
         header_layout.addWidget(title_label)
         header_layout.addWidget(subtitle_label)
@@ -245,33 +387,31 @@ class AutoCalibrateWindow(QMainWindow):
         config_layout.setHorizontalSpacing(14)
         config_layout.setVerticalSpacing(14)
 
-        device_type_label = QLabel("设备类型")
         self.device_type_combo = QComboBox()
         self.device_type_combo.addItem("tele", "tele")
         self.device_type_combo.addItem("robot", "robot")
         self.device_type_combo.currentIndexChanged.connect(self.on_device_type_changed)
 
-        port_label = QLabel("COM 端口")
         self.port_combo = QComboBox()
         self.port_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.port_combo.currentIndexChanged.connect(self.update_action_buttons)
-        self.refresh_button = QPushButton("刷新端口")
+
+        self.refresh_button = QPushButton("刷新串口")
         self.refresh_button.clicked.connect(self.refresh_ports)
 
-        filename_label = QLabel("输出文件名")
         self.filename_input = QLineEdit("my_so101")
-        self.filename_input.setPlaceholderText("例如: tele_calibration 或 robot_01.json")
+        self.filename_input.setPlaceholderText("例如：tele_calibration 或 robot_01.json")
         self.filename_input.textChanged.connect(self.update_action_buttons)
 
-        filename_hint = QLabel("最终会保存为同一路径下的 JSON 文件，只改文件名，不改保存目录。")
+        filename_hint = QLabel("只修改文件名，不修改保存目录。最终仍保存到设备默认 calibration 路径。")
         filename_hint.setObjectName("hintLabel")
 
-        config_layout.addWidget(device_type_label, 0, 0)
+        config_layout.addWidget(QLabel("设备类型"), 0, 0)
         config_layout.addWidget(self.device_type_combo, 0, 1, 1, 2)
-        config_layout.addWidget(port_label, 1, 0)
+        config_layout.addWidget(QLabel("串口"), 1, 0)
         config_layout.addWidget(self.port_combo, 1, 1)
         config_layout.addWidget(self.refresh_button, 1, 2)
-        config_layout.addWidget(filename_label, 2, 0)
+        config_layout.addWidget(QLabel("输出文件名"), 2, 0)
         config_layout.addWidget(self.filename_input, 2, 1, 1, 2)
         config_layout.addWidget(filename_hint, 3, 0, 1, 3)
 
@@ -281,6 +421,7 @@ class AutoCalibrateWindow(QMainWindow):
 
         self.status_badge = QLabel(STATUS_IDLE)
         self.status_badge.setObjectName("statusBadge")
+
         self.status_detail_label = QLabel("等待检测串口。")
         self.status_detail_label.setWordWrap(True)
         self.status_detail_label.setObjectName("statusDetailLabel")
@@ -293,7 +434,7 @@ class AutoCalibrateWindow(QMainWindow):
         info_layout.addWidget(self.status_badge)
         info_layout.addWidget(self.status_detail_label)
 
-        self.output_hint_label = QLabel("输出文件: 未生成")
+        self.output_hint_label = QLabel("输出文件：未生成")
         self.output_hint_label.setWordWrap(True)
         self.output_hint_label.setObjectName("outputHintLabel")
 
@@ -309,15 +450,24 @@ class AutoCalibrateWindow(QMainWindow):
         main_layout.addLayout(button_layout)
 
         self.start_button = QPushButton("开始标定")
-        self.start_button.clicked.connect(self.start_calibration)
         self.start_button.setObjectName("primaryButton")
+        self.start_button.clicked.connect(self.start_calibration)
 
         self.recalibrate_button = QPushButton("重新标定")
         self.recalibrate_button.clicked.connect(self.restart_calibration)
-        self.recalibrate_button.setEnabled(False)
+
+        self.arm_check_button = QPushButton("检测机械臂")
+        self.arm_check_button.clicked.connect(self.start_arm_check)
+
+        self.permission_button = QPushButton("Linux 端口授权")
+        self.permission_button.clicked.connect(self.grant_linux_permissions)
+        self.permission_button.setVisible(IS_LINUX)
 
         button_layout.addWidget(self.start_button)
         button_layout.addWidget(self.recalibrate_button)
+        button_layout.addWidget(self.arm_check_button)
+        if IS_LINUX:
+            button_layout.addWidget(self.permission_button)
         button_layout.addStretch(1)
 
         log_group = QGroupBox("日志输出")
@@ -330,7 +480,7 @@ class AutoCalibrateWindow(QMainWindow):
         log_layout.addWidget(self.log_output)
         main_layout.addWidget(log_group, 1)
 
-        self.append_log("UI 已启动，正在检测本机可用 COM 端口。")
+        self.append_log(f"UI 已启动，正在检测本机可用串口。当前图形库：{QT_LIB}")
         self.update_action_buttons()
 
     def _apply_styles(self):
@@ -453,9 +603,10 @@ class AutoCalibrateWindow(QMainWindow):
             STATUS_CALIBRATING: "#a05a00",
             STATUS_FINISHED: "#0f766e",
             STATUS_FAILED: "#b42318",
+            STATUS_AUTHORIZING: "#7c3aed",
+            STATUS_CHECKING_ARM: "#2563eb",
         }
-        color = color_map.get(status, "#173f35")
-        self.status_badge.setStyleSheet(f"color: {QColor(color).name()};")
+        self.status_badge.setStyleSheet(f"color: {QColor(color_map.get(status, '#173f35')).name()};")
 
     def on_device_type_changed(self):
         suggested_name = "tele_calibration" if self.selected_device_type() == "tele" else "robot_calibration"
@@ -471,14 +622,17 @@ class AutoCalibrateWindow(QMainWindow):
     def list_available_ports(self) -> list[SerialPortInfo]:
         ports: list[SerialPortInfo] = []
         for port in list_ports.comports():
-            if sys.platform.startswith("win") and not str(port.device).upper().startswith("COM"):
+            device_name = str(port.device)
+            if IS_WINDOWS and not device_name.upper().startswith("COM"):
                 continue
-            ports.append(SerialPortInfo(device=port.device, description=port.description or "Unknown device"))
+            if IS_LINUX and LINUX_PORT_PREFIX not in device_name:
+                continue
+            ports.append(SerialPortInfo(device=device_name, description=port.description or "Unknown device"))
         ports.sort(key=lambda item: item.device)
         return ports
 
     def refresh_ports(self):
-        if self.current_status == STATUS_CALIBRATING:
+        if self.current_status in BUSY_STATUSES:
             return
 
         current_port = self.selected_port()
@@ -503,7 +657,10 @@ class AutoCalibrateWindow(QMainWindow):
             if ports:
                 self.set_status(STATUS_PORT_DETECTED, f"当前检测到 {len(ports)} 个可用串口。")
             else:
-                self.set_status(STATUS_IDLE, "未检测到可用串口，请连接设备后重试。")
+                if IS_LINUX:
+                    self.set_status(STATUS_IDLE, "未检测到 /dev/ttyACM* 串口，请连接设备后重试。")
+                else:
+                    self.set_status(STATUS_IDLE, "未检测到可用串口，请连接设备后重试。")
 
         self.update_output_preview()
         self.update_action_buttons()
@@ -518,40 +675,57 @@ class AutoCalibrateWindow(QMainWindow):
         text = self.filename_input.text().strip()
         if not text:
             return ""
-        if text.lower().endswith(".json"):
-            return text
-        return f"{text}.json"
+        return text if text.lower().endswith(".json") else f"{text}.json"
 
     def update_output_preview(self):
         filename = self.normalized_filename()
         if not filename:
-            self.output_hint_label.setText("输出文件: 请先输入文件名")
+            self.output_hint_label.setText("输出文件：请先输入文件名")
             return
 
         if self.last_output_path:
             preview_path = Path(self.last_output_path).with_name(filename)
-            self.output_hint_label.setText(f"输出文件: {preview_path}")
+            self.output_hint_label.setText(f"输出文件：{preview_path}")
             return
 
-        self.output_hint_label.setText(f"输出文件名: {filename}  |  保存目录将沿用当前标定代码默认路径")
+        self.output_hint_label.setText(f"输出文件：{filename} | 保存目录沿用设备默认 calibration 路径")
 
     def can_start_calibration(self) -> bool:
         return bool(self.selected_port() and self.filename_input.text().strip())
 
+    def start_worker(self, worker: WorkerBase):
+        self.worker_thread = QThread(self)
+        self.worker = worker
+        self.worker.moveToThread(self.worker_thread)
+
+        self.worker_thread.started.connect(self.worker.run)
+        self.worker.status_changed.connect(self.set_status)
+        self.worker.succeeded.connect(self.on_worker_success)
+        self.worker.failed.connect(self.on_worker_failed)
+        self.worker.finished.connect(self.worker_thread.quit)
+        self.worker.finished.connect(self.worker.deleteLater)
+        self.worker_thread.finished.connect(self.worker_thread.deleteLater)
+        self.worker_thread.finished.connect(self.on_worker_finished)
+        self.worker_thread.start()
+        self.update_action_buttons()
+
     def update_action_buttons(self):
         ready = self.can_start_calibration()
-        is_busy = self.current_status == STATUS_CALIBRATING
+        is_busy = self.current_status in BUSY_STATUSES
 
         self.start_button.setEnabled(ready and not is_busy and self.current_status in ACTIVE_STATUSES)
         self.recalibrate_button.setEnabled(ready and not is_busy and self.current_status in TERMINAL_STATUSES)
+        self.arm_check_button.setEnabled(bool(self.selected_port()) and not is_busy)
         self.refresh_button.setEnabled(not is_busy)
         self.device_type_combo.setEnabled(not is_busy)
         self.port_combo.setEnabled(not is_busy)
         self.filename_input.setEnabled(not is_busy)
+        if IS_LINUX:
+            self.permission_button.setEnabled(not is_busy)
 
     def start_calibration(self):
         if not self.can_start_calibration():
-            QMessageBox.warning(self, "输入不完整", "请选择设备类型、COM 端口，并填写输出文件名。")
+            QMessageBox.warning(self, "输入不完整", "请选择设备类型、串口，并填写输出文件名。")
             return
 
         selected_port = self.selected_port()
@@ -560,38 +734,56 @@ class AutoCalibrateWindow(QMainWindow):
 
         self.append_log("")
         self.append_log("=" * 72)
-        self.append_log(f"准备开始标定 | device_type={selected_type} | port={selected_port} | file={filename}")
-
-        self.set_status(STATUS_CALIBRATING, f"正在对 {selected_type} 设备进行标定，请勿断开 USB。")
-
-        self.worker_thread = QThread(self)
-        self.worker = CalibrationWorker(selected_type, selected_port, filename)
-        self.worker.moveToThread(self.worker_thread)
-
-        self.worker_thread.started.connect(self.worker.run)
-        self.worker.status_changed.connect(self.set_status)
-        self.worker.succeeded.connect(self.on_calibration_success)
-        self.worker.failed.connect(self.on_calibration_failed)
-        self.worker.finished.connect(self.worker_thread.quit)
-        self.worker.finished.connect(self.worker.deleteLater)
-        self.worker_thread.finished.connect(self.worker_thread.deleteLater)
-        self.worker_thread.finished.connect(self.on_worker_finished)
-        self.worker_thread.start()
-
-        self.update_action_buttons()
+        self.append_log(
+            f"准备开始标定 | device_type={selected_type} | port={selected_port} | file={filename}"
+        )
+        self.start_worker(CalibrationWorker(selected_type, selected_port, filename))
 
     def restart_calibration(self):
         self.append_log("收到重新标定请求，准备重新开始。")
         self.start_calibration()
 
-    def on_calibration_success(self, output_path: str):
-        self.last_output_path = output_path
-        self.update_output_preview()
-        self.append_log(f"标定成功，输出文件: {output_path}")
+    def start_arm_check(self):
+        selected_port = self.selected_port()
+        if not selected_port:
+            QMessageBox.warning(self, "未选择串口", "请先选择串口。")
+            return
 
-    def on_calibration_failed(self, error_message: str):
-        self.append_log(f"标定失败: {error_message}")
-        QMessageBox.critical(self, "标定失败", error_message)
+        self.append_log("")
+        self.append_log("=" * 72)
+        self.append_log(f"准备检测机械臂 | device_type={self.selected_device_type()} | port={selected_port}")
+        self.start_worker(ArmCheckWorker(self.selected_device_type(), selected_port))
+
+    def grant_linux_permissions(self):
+        if not IS_LINUX:
+            return
+
+        password, ok = QInputDialog.getText(
+            self,
+            "Linux 端口授权",
+            "请输入 sudo 密码：",
+            QLineEdit.Password,
+        )
+        if not ok:
+            return
+        if not password:
+            QMessageBox.warning(self, "密码为空", "请输入 sudo 密码。")
+            return
+
+        self.append_log("")
+        self.append_log("=" * 72)
+        self.append_log("准备执行 Linux 端口授权。")
+        self.start_worker(LinuxPermissionWorker(password))
+
+    def on_worker_success(self, message: str):
+        if self.current_status == STATUS_FINISHED:
+            self.last_output_path = message
+            self.update_output_preview()
+        self.append_log(message)
+
+    def on_worker_failed(self, error_message: str):
+        self.append_log(f"操作失败：{error_message}")
+        QMessageBox.critical(self, "操作失败", error_message)
 
     def on_worker_finished(self):
         self.worker = None
