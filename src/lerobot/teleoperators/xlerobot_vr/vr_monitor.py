@@ -16,8 +16,21 @@ import socket
 from pathlib import Path
 from typing import Optional
 
-# Set the absolute path to the xlevr folder
-XLEVR_PATH = "/home/joyandai/lerobot/XLeVR"
+
+def _find_repo_root(start_path: Path) -> Path:
+    current = start_path.resolve()
+    for candidate in (current, *current.parents):
+        if (candidate / "pyproject.toml").exists() or (candidate / ".git").exists():
+            return candidate
+    raise RuntimeError(f"Could not find lerobot project root from {start_path}")
+
+
+def _resolve_xlevr_path() -> str:
+    repo_root = _find_repo_root(Path(__file__).parent)
+    return str((repo_root / "XLeVR").resolve())
+
+
+XLEVR_PATH = _resolve_xlevr_path()
 
 def setup_xlevr_environment():
     """Setup xlevr environment"""

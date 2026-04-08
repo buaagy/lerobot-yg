@@ -131,6 +131,7 @@ from lerobot.teleoperators import (  # noqa: F401
     reachy2_teleoperator,
     so_leader,
     unitree_g1,
+    xlerobot_vr,
 )
 from lerobot.teleoperators.keyboard.teleop_keyboard import KeyboardTeleop
 from lerobot.utils.constants import ACTION, OBS_STR
@@ -349,8 +350,21 @@ def record_loop(
         # Get robot observation
         obs = robot.get_observation()
 
+        if (
+            isinstance(teleop, Teleoperator)
+            and teleop.feedback_features
+            and robot.name != "unitree_g1"
+        ):
+            teleop.send_feedback(obs)
+
         # Applies a pipeline to the raw robot observation, default is IdentityProcessor
         obs_processed = robot_observation_processor(obs)
+
+        if isinstance(teleop, Teleoperator) and hasattr(teleop, "get_teleop_events"):
+            teleop_events = teleop.get_teleop_events()
+            for event_name, event_value in teleop_events.items():
+                if event_name in events and event_value:
+                    events[event_name] = True
 
         if policy is not None or dataset is not None:
             observation_frame = build_dataset_frame(dataset.features, obs_processed, prefix=OBS_STR)

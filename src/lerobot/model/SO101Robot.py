@@ -1,11 +1,11 @@
 import math
-import numpy as np
-from typing import List, Union, Tuple
+import math
+from typing import List, Tuple, Union
 
-from lerobot.robots.robot import Robot
-from lerobot.robots.so101_follower.config_so101_follower import SO101FollowerConfig
-from lerobot.robots.utils import make_robot_from_config
 import numpy as np
+from lerobot.robots.robot import Robot
+from lerobot.robots.so_follower import SO101FollowerConfig
+from lerobot.robots.utils import make_robot_from_config
 from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig
 from lerobot.cameras import ColorMode, Cv2Rotation
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig

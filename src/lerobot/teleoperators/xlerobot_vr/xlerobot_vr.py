@@ -14,49 +14,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-XLerobot VR Teleoperator
-Refactored based on VR control logic from 8_xlerobot_VR_teleop.py, following teleop_keyboard format
-"""
-
 import asyncio
 import logging
-import os
-import sys
 import threading
 import time
-import traceback
-from queue import Queue
-from typing import Any, Dict, Optional
+from typing import Any
 
-import numpy as np
-
-# from lerobot.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
 from lerobot.model.SO101Robot import SO101Kinematics
 
 from ..teleoperator import Teleoperator
 from .configuration_xlerobot_vr import XLerobotVRTeleopConfig
 
-# Setup logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Check VR Monitor availability
 VR_AVAILABLE = True
 try:
-    # Dynamically import VR Monitor 
     from .vr_monitor import VRMonitor
-except ImportError as e:
+except Exception as exc:  # pragma: no cover - depends on local VR runtime
     VR_AVAILABLE = False
     VRMonitor = None
-    logging.warning(f"VR Monitor not available: {e}")
-except Exception as e:
-    VR_AVAILABLE = False
-    VRMonitor = None
-    logging.warning(f"Could not import VR Monitor: {e}")
+    logger.warning(f"VR Monitor not available: {exc}")
 
 
-# Joint mapping configurations (copied from 8_xlerobot_VR_teleop.py)
 LEFT_JOINT_MAP = {
     "shoulder_pan": "left_arm_shoulder_pan",
     "shoulder_lift": "left_arm_shoulder_lift",
@@ -80,55 +59,81 @@ HEAD_MOTOR_MAP = {
     "head_motor_2": "head_motor_2",
 }
 
-# Joint calibration coefficients (copied from 8_xlerobot_VR_teleop.py)
-JOINT_CALIBRATION = [
-    ['shoulder_pan', 6.0, 1.0],      
-    ['shoulder_lift', 2.0, 0.97],     
-    ['elbow_flex', 0.0, 1.05],        
-    ['wrist_flex', 0.0, 0.94],        
-    ['wrist_roll', 0.0, 0.5],        
-    ['gripper', 0.0, 1.0],           
-]
+STATE_FEATURES = {
+    "left_arm_shoulder_pan.pos": float,
+    "left_arm_shoulder_lift.pos": float,
+    "left_arm_elbow_flex.pos": float,
+    "left_arm_wrist_flex.pos": float,
+    "left_arm_wrist_roll.pos": float,
+    "left_arm_gripper.pos": float,
+    "right_arm_shoulder_pan.pos": float,
+    "right_arm_shoulder_lift.pos": float,
+    "right_arm_elbow_flex.pos": float,
+    "right_arm_wrist_flex.pos": float,
+    "right_arm_wrist_roll.pos": float,
+    "right_arm_gripper.pos": float,
+    "head_motor_1.pos": float,
+    "head_motor_2.pos": float,
+    "x.vel": float,
+    "y.vel": float,
+    "theta.vel": float,
+}
+
+ARM_JOINT_NAMES = (
+    "shoulder_pan",
+    "shoulder_lift",
+    "elbow_flex",
+    "wrist_flex",
+    "wrist_roll",
+    "gripper",
+)
+
+
+def resolve_arm_joint_map(robot_obs: dict[str, Any], side: str | None = None) -> dict[str, str]:
+    joint_map = {}
+    for joint_name in ARM_JOINT_NAMES:
+        candidates = []
+        if side:
+            candidates.extend(
+                (
+                    f"{side}_arm_{joint_name}.pos",
+                    f"{side}_{joint_name}.pos",
+                )
+            )
+        candidates.append(f"{joint_name}.pos")
+        for key in candidates:
+            if key in robot_obs:
+                joint_map[joint_name] = key.removesuffix(".pos")
+                break
+
+    missing = [joint_name for joint_name in ARM_JOINT_NAMES if joint_name not in joint_map]
+    if missing:
+        arm_label = side if side else "single"
+        raise RuntimeError(
+            f"Could not resolve {arm_label} arm joint keys from robot observation. Missing: {missing}"
+        )
+
+    return joint_map
+
 
 class SimpleTeleopArm:
-    """
-    A class for controlling a robot arm using VR input with delta action control.
-    
-    This class provides inverse kinematics-based arm control with proportional control
-    for smooth movement and gripper operations based on VR controller input.
-    """
-    
-    def __init__(self, joint_map, initial_obs, kinematics, prefix="right", kp=1):
+    def __init__(
+        self,
+        joint_map: dict[str, str],
+        initial_obs: dict[str, Any],
+        kinematics,
+        prefix: str,
+        config: XLerobotVRTeleopConfig,
+    ):
         self.joint_map = joint_map
         self.prefix = prefix
-        self.kp = kp
+        self.kp = config.kp
         self.kinematics = kinematics
-        
-        # Initial joint positions - adapted for XLerobot observation format
-        self.joint_positions = {
-            "shoulder_pan": initial_obs[f"{prefix}_arm_shoulder_pan.pos"],
-            "shoulder_lift": initial_obs[f"{prefix}_arm_shoulder_lift.pos"],
-            "elbow_flex": initial_obs[f"{prefix}_arm_elbow_flex.pos"],
-            "wrist_flex": initial_obs[f"{prefix}_arm_wrist_flex.pos"],
-            "wrist_roll": initial_obs[f"{prefix}_arm_wrist_roll.pos"],
-            "gripper": initial_obs[f"{prefix}_arm_gripper.pos"],
-        }
-        
-        # Set initial x/y to fixed values
-        self.current_x = 0.1629
-        self.current_y = 0.1131
+        self.config = config
+
+        self.current_x = config.arm_initial_x
+        self.current_y = config.arm_initial_y
         self.pitch = 0.0
-        
-        # Delta control state variables for VR input
-        self.last_vr_time = 0.0
-        self.vr_deadzone = 0.001  # Minimum movement threshold
-        self.max_delta_per_frame = 0.005  # Maximum position change per frame
-        
-        # Set step size
-        self.degree_step = 2
-        self.xy_step = 0.005
-        
-        # P control target positions, set to zero position
         self.target_positions = {
             "shoulder_pan": 0.0,
             "shoulder_lift": 0.0,
@@ -137,810 +142,506 @@ class SimpleTeleopArm:
             "wrist_roll": 0.0,
             "gripper": 0.0,
         }
-        self.zero_pos = {
-            'shoulder_pan': 0.0,
-            'shoulder_lift': 0.0,
-            'elbow_flex': 0.0,
-            'wrist_flex': 0.0,
-            'wrist_roll': 0.0,
-            'gripper': 0.0
+        self.zero_pos = self.target_positions.copy()
+
+        for joint_name, motor_name in joint_map.items():
+            self.target_positions[joint_name] = float(initial_obs.get(f"{motor_name}.pos", 0.0))
+
+        self.prev_vr_pos = None
+        self.prev_wrist_flex = None
+        self.prev_wrist_roll = None
+
+    def move_to_zero_position(self) -> dict[str, float]:
+        self.target_positions = self.zero_pos.copy()
+        self.current_x = self.config.arm_initial_x
+        self.current_y = self.config.arm_initial_y
+        self.pitch = 0.0
+        self.prev_vr_pos = None
+        self.prev_wrist_flex = None
+        self.prev_wrist_roll = None
+        self.target_positions["wrist_flex"] = 0.0
+        return {
+            f"{motor_name}.pos": self.target_positions[joint_name]
+            for joint_name, motor_name in self.joint_map.items()
         }
 
-    def move_to_zero_position(self, robot):
-        print(f"[{self.prefix}] Moving to Zero Position: {self.zero_pos} ......")
-        self.target_positions = self.zero_pos.copy()
-        
-        # Reset kinematics variables to initial state
-        self.current_x = 0.1629
-        self.current_y = 0.1131
-        self.pitch = 0.0
-        
-        # Reset delta control state
-        self.last_vr_time = 0.0
-        
-        # Explicitly set wrist_flex
-        self.target_positions["wrist_flex"] = 0.0
-        
-        action = self.p_control_action(robot)
-        return action
+    def handle_vr_input(self, vr_goal) -> None:
+        if vr_goal is None or getattr(vr_goal, "target_position", None) is None:
+            return
 
-    def handle_vr_input(self, vr_goal, gripper_state):
-        """
-        Handle VR input with delta action control - incremental position updates.
-        
-        Args:
-            vr_goal: VR controller goal data containing target position and orientations
-            gripper_state: Current gripper state (not used in current implementation)
-        """
-        if vr_goal is None:
-            return
-        
-        # VR goal contains: target_position [x, y, z], wrist_roll_deg, wrist_flex_deg, gripper_closed
-        if not hasattr(vr_goal, 'target_position') or vr_goal.target_position is None:
-            return
-            
-        # Extract VR position data
-        # Get current VR position
-        current_vr_pos = vr_goal.target_position  # [x, y, z] in meters
-        
-        # Initialize previous VR position if not set
-        if not hasattr(self, 'prev_vr_pos'):
+        current_vr_pos = vr_goal.target_position
+        if self.prev_vr_pos is None:
             self.prev_vr_pos = current_vr_pos
-            return  # Skip first frame to establish baseline
-        
-        # Calculate relative change (delta) from previous frame
-        vr_x = (current_vr_pos[0] - self.prev_vr_pos[0]) * 220 # Scale for the shoulder
-        vr_y = (current_vr_pos[1] - self.prev_vr_pos[1]) * 110 
-        vr_z = (current_vr_pos[2] - self.prev_vr_pos[2]) * 110
+            return
 
-        # print(f'vr_x: {vr_x}, vr_y: {vr_y}, vr_z: {vr_z}')
-
-        # Update previous position for next frame
+        vr_x = (current_vr_pos[0] - self.prev_vr_pos[0]) * self.config.arm_position_scale_x
+        vr_y = (current_vr_pos[1] - self.prev_vr_pos[1]) * self.config.arm_position_scale_y
+        vr_z = (current_vr_pos[2] - self.prev_vr_pos[2]) * self.config.arm_position_scale_z
         self.prev_vr_pos = current_vr_pos
-        
-        # Delta control parameters - adjust these for sensitivity
-        pos_scale = 0.02  # Position sensitivity scaling
-        angle_scale = 2.0  # Angle sensitivity scaling
-        delta_limit = 0.01  # Maximum delta per update (meters)
-        angle_limit = 6.0  # Maximum angle delta per update (degrees)
-        
-        delta_x = vr_x * pos_scale
-        delta_y = vr_y * pos_scale  
-        delta_z = vr_z * pos_scale
-        
-        # Limit delta values to prevent sudden movements
-        delta_x = max(-delta_limit, min(delta_limit, delta_x))
-        delta_y = max(-delta_limit, min(delta_limit, delta_y))
-        delta_z = max(-delta_limit, min(delta_limit, delta_z))
-        
-        self.current_x += -delta_z  # yy: VR Z maps to robot x, change the direction
-        self.current_y += delta_y  # yy:VR Y maps to robot y
 
-        # Handle wrist angles with delta control - use relative changes
-        if hasattr(vr_goal, 'wrist_flex_deg') and vr_goal.wrist_flex_deg is not None:
-            # Initialize previous wrist_flex if not set
-            if not hasattr(self, 'prev_wrist_flex'):
-                self.prev_wrist_flex = vr_goal.wrist_flex_deg
-                return
-            
-            # Calculate relative change from previous frame
-            delta_pitch = (vr_goal.wrist_flex_deg - self.prev_wrist_flex) * angle_scale
-            delta_pitch = max(-angle_limit, min(angle_limit, delta_pitch))
-            self.pitch += delta_pitch
-            self.pitch = max(-90, min(90, self.pitch))  # Limit pitch range
-            
-            # Update previous value for next frame
-            self.prev_wrist_flex = vr_goal.wrist_flex_deg
-        
-        if hasattr(vr_goal, 'wrist_roll_deg') and vr_goal.wrist_roll_deg is not None:
-            # Initialize previous wrist_roll if not set
-            if not hasattr(self, 'prev_wrist_roll'):
-                self.prev_wrist_roll = vr_goal.wrist_roll_deg
-                return
-            
-            delta_roll = (vr_goal.wrist_roll_deg - self.prev_wrist_roll) * angle_scale
-            delta_roll = max(-angle_limit, min(angle_limit, delta_roll))
-            
-            current_roll = self.target_positions.get("wrist_roll", 0.0)
-            new_roll = current_roll + delta_roll
-            new_roll = max(-90, min(90, new_roll))  # Limit roll range
-            self.target_positions["wrist_roll"] = new_roll
-            
-            # Update previous value for next frame
-            self.prev_wrist_roll = vr_goal.wrist_roll_deg
-        
-        # VR Z axis controls shoulder_pan joint (delta control)
-        if abs(delta_x) > 0.001:  # Only update if significant movement
-            x_scale = 180.0  # Reduced scaling factor for delta control
-            delta_pan = delta_x * x_scale
-            delta_pan = max(-angle_limit, min(angle_limit, delta_pan))
+        pos_scale = self.config.arm_delta_position_scale
+        angle_scale = self.config.arm_angle_scale
+        delta_limit = self.config.arm_delta_limit
+        angle_limit = self.config.arm_angle_limit
+
+        delta_x = max(-delta_limit, min(delta_limit, vr_x * pos_scale))
+        delta_y = max(-delta_limit, min(delta_limit, vr_y * pos_scale))
+        delta_z = max(-delta_limit, min(delta_limit, vr_z * pos_scale))
+
+        self.current_x += -delta_z
+        self.current_y += delta_y
+
+        wrist_flex_deg = getattr(vr_goal, "wrist_flex_deg", None)
+        if wrist_flex_deg is not None:
+            if self.prev_wrist_flex is None:
+                self.prev_wrist_flex = wrist_flex_deg
+            else:
+                delta_pitch = (wrist_flex_deg - self.prev_wrist_flex) * angle_scale
+                delta_pitch = max(-angle_limit, min(angle_limit, delta_pitch))
+                self.pitch = max(-90, min(90, self.pitch + delta_pitch))
+                self.prev_wrist_flex = wrist_flex_deg
+
+        wrist_roll_deg = getattr(vr_goal, "wrist_roll_deg", None)
+        if wrist_roll_deg is not None:
+            if self.prev_wrist_roll is None:
+                self.prev_wrist_roll = wrist_roll_deg
+            else:
+                delta_roll = (wrist_roll_deg - self.prev_wrist_roll) * angle_scale
+                delta_roll = max(-angle_limit, min(angle_limit, delta_roll))
+                current_roll = self.target_positions.get("wrist_roll", 0.0)
+                self.target_positions["wrist_roll"] = max(-90, min(90, current_roll + delta_roll))
+                self.prev_wrist_roll = wrist_roll_deg
+
+        if abs(delta_x) > 0.001:
+            delta_pan = max(-angle_limit, min(angle_limit, delta_x * self.config.arm_pan_scale))
             current_pan = self.target_positions.get("shoulder_pan", 0.0)
-            new_pan = current_pan + delta_pan
-            new_pan = max(-180, min(180, new_pan))  # Limit pan range
-            self.target_positions["shoulder_pan"] = new_pan
-        
+            self.target_positions["shoulder_pan"] = max(-180, min(180, current_pan + delta_pan))
+
         try:
             joint2_target, joint3_target = self.kinematics.inverse_kinematics(self.current_x, self.current_y)
-            # Smooth transition to new joint positions,  Smoothing factor 0-1, lower = smoother
-            alpha = 0.27
-            self.target_positions["shoulder_lift"] = (1-alpha) * self.target_positions.get("shoulder_lift", 0.0) + alpha * joint2_target
-            self.target_positions["elbow_flex"] = (1-alpha) * self.target_positions.get("elbow_flex", 0.0) + alpha * joint3_target
-        except Exception as e:
-            print(f"[{self.prefix}] VR IK failed: {e}")
-        
-        # Calculate wrist_flex to maintain end-effector orientation
-        self.target_positions["wrist_flex"] = (-self.target_positions["shoulder_lift"] - 
-                                               self.target_positions["elbow_flex"] + self.pitch)
-   
-        # Handle gripper state directly
-        if vr_goal.metadata.get('trigger', 0) > 0.5:
-            self.target_positions["gripper"] = 45
-        else:
-            self.target_positions["gripper"] = 0.0
+            alpha = self.config.arm_ik_alpha
+            self.target_positions["shoulder_lift"] = (1 - alpha) * self.target_positions["shoulder_lift"] + alpha * joint2_target
+            self.target_positions["elbow_flex"] = (1 - alpha) * self.target_positions["elbow_flex"] + alpha * joint3_target
+        except Exception as exc:
+            logger.debug(f"[{self.prefix}] VR IK failed: {exc}")
 
-   
-    def get_action(self, robot_obs: Optional[Dict] = None, robot = None) -> dict[str, Any]:
-        """Get VR control action - high-performance optimized version, parallel processing of events and actions"""
-        before_read_t = time.perf_counter()
-        
+        self.target_positions["wrist_flex"] = (
+            -self.target_positions["shoulder_lift"] - self.target_positions["elbow_flex"] + self.pitch
+        )
+        self.target_positions["gripper"] = (
+            self.config.gripper_close_position if vr_goal.metadata.get("trigger", 0) > 0.5 else 0.0
+        )
+
+    def p_control_action(self, robot_obs: dict[str, Any]) -> dict[str, float]:
         action = {}
-        
-        # Quick check VR monitoring status
-        if not self.vr_monitor:
-            self.logs["read_pos_dt_s"] = time.perf_counter() - before_read_t
-            return action
-        
-        # Get VR data once to avoid repeated calls
-        try:
-            dual_goals = self.vr_monitor.get_latest_goal_nowait()
-            if dual_goals is None:
-                self.logs["read_pos_dt_s"] = time.perf_counter() - before_read_t
-                return action
-                
-            left_goal = dual_goals.get("left")
-            right_goal = dual_goals.get("right")
-            
-        except Exception as e:
-            logger.warning(f"VR data acquisition failed: {e}")
-            self.logs["read_pos_dt_s"] = time.perf_counter() - before_read_t
-            return action
-        
-        # Parallel processing: robot control at high frequency, event processing at low frequency
-        if robot_obs is not None:
-            try:
-                current_time = time.perf_counter()
-                
-                # Robot control - high frequency execution (60Hz)
-                if left_goal is not None:
-                    self.left_arm.handle_vr_input(left_goal, None)
-                    
-                if right_goal is not None:
-                    self.right_arm.handle_vr_input(right_goal, None)
-                
-                # # Event processing - low frequency execution (10Hz), only process when interval time is reached
-                # if (current_time - self.last_event_update_time) >= 0.1:
-                if left_goal is not None:
-                    self._update_events_inline(left_goal)
-                self.last_event_update_time = current_time
-                
-                # Quickly generate action dictionary
-                left_action = self.left_arm.p_control_action(robot_obs)
-                right_action = self.right_arm.p_control_action(robot_obs)
-                head_action = self.head_control.p_control_action(robot_obs)
-                base_action = get_vr_base_action(right_goal, robot)
-                
-                # Efficiently merge actions
-                action.update(left_action)
-                action.update(right_action)
-                action.update(head_action)
-                action.update(base_action)
-                
-            except Exception as e:
-                logger.error(f"Action generation failed: {e}")
-            
-        self.logs["read_pos_dt_s"] = time.perf_counter() - before_read_t
+        for joint_name, motor_name in self.joint_map.items():
+            current = float(robot_obs.get(f"{motor_name}.pos", 0.0))
+            error = self.target_positions[joint_name] - current
+            action[f"{motor_name}.pos"] = current + self.kp * error
         return action
-   
+
+
 class SimpleHeadControl:
-    """
-    A class for controlling robot head motors using VR thumbstick input.
-    
-    Provides simple head movement control with proportional control for smooth operation.
-    """
-    
-    def __init__(self, initial_obs, kp=1):
-        self.kp = kp
-        self.degree_step = 2  # Move 2 degrees each time
-        # Initialize head motor positions
+    def __init__(self, initial_obs: dict[str, Any], config: XLerobotVRTeleopConfig):
+        self.kp = config.kp
+        self.degree_step = config.head_step_deg
+        self.config = config
         self.target_positions = {
-            "head_motor_1": initial_obs.get("head_motor_1.pos", 0.0),
-            "head_motor_2": initial_obs.get("head_motor_2.pos", 0.0),
+            "head_motor_1": float(initial_obs.get("head_motor_1.pos", 0.0)),
+            "head_motor_2": float(initial_obs.get("head_motor_2.pos", config.head_zero_motor_2)),
         }
-        self.zero_pos = {"head_motor_1": 0.0, "head_motor_2": 0.0}
+        self.zero_pos = {
+            "head_motor_1": config.head_zero_motor_1,
+            "head_motor_2": config.head_zero_motor_2,
+        }
 
-    def handle_vr_input(self, vr_goal):
-        # Map VR input to head motor targets
-        thumb = vr_goal.metadata.get('thumbstick', {})
-        if thumb:
-            thumb_x = thumb.get('x', 0)
-            thumb_y = thumb.get('y', 0)
-            if abs(thumb_x) > 0.1:
-                if thumb_x > 0:
-                    self.target_positions["head_motor_1"] += self.degree_step
-                else:
-                    self.target_positions["head_motor_1"] -= self.degree_step
-            if abs(thumb_y) > 0.1:
-                if thumb_y > 0:
-                    self.target_positions["head_motor_2"] += self.degree_step
-                else:
-                    self.target_positions["head_motor_2"] -= self.degree_step
-                    
-    def move_to_zero_position(self, robot_obs):
-        print(f"[HEAD] Moving to Zero Position: {self.zero_pos} ......")
+    def handle_vr_input(self, vr_goal) -> None:
+        if vr_goal is None:
+            return
+        thumb = vr_goal.metadata.get("thumbstick", {})
+        thumb_x = thumb.get("x", 0.0)
+        thumb_y = thumb.get("y", 0.0)
+        if abs(thumb_x) > 0.1:
+            self.target_positions["head_motor_1"] += self.degree_step if thumb_x > 0 else -self.degree_step
+        if abs(thumb_y) > 0.1:
+            self.target_positions["head_motor_2"] += self.degree_step if thumb_y > 0 else -self.degree_step
+
+    def move_to_zero_position(self) -> dict[str, float]:
         self.target_positions = self.zero_pos.copy()
-        action = self.p_control_action(robot_obs)
-        return action
-        
+        return {f"{motor}.pos": value for motor, value in self.target_positions.items()}
 
-    def p_control_action(self, robot_obs):
-        """
-        Generate proportional control action for head motors.
-        
-        Args:
-            robot: Robot instance to get current observations
-            
-        Returns:
-            dict: Action dictionary with position commands for head motors
-        """
-        obs = robot_obs
+    def p_control_action(self, robot_obs: dict[str, Any]) -> dict[str, float]:
         action = {}
-        for motor in self.target_positions:
-            current = obs.get(f"{HEAD_MOTOR_MAP[motor]}.pos", 0.0)
-            error = self.target_positions[motor] - current
-            control = self.kp * error
-            action[f"{HEAD_MOTOR_MAP[motor]}.pos"] = current + control
+        for motor, target in self.target_positions.items():
+            current = float(robot_obs.get(f"{motor}.pos", 0.0))
+            action[f"{motor}.pos"] = current + self.kp * (target - current)
         return action
 
 
-def get_vr_base_action(vr_goal, robot):
-    """
-    Get base control commands from VR input.
-    
-    Args:
-        vr_goal: VR controller goal data containing metadata
-        robot: Robot instance for action conversion
-        
-    Returns:
-        dict: Base movement actions based on VR thumbstick input
-    """
-    pressed_keys = set()
-    if vr_goal is not None and hasattr(vr_goal, 'metadata'):
-    
-    # Build key set based on VR input (you can customize this mapping)
-    
-    # Example VR to base movement mapping - adjust according to your VR system
-    # You may need to customize these mappings based on your VR controller buttons
-        thumb = vr_goal.metadata.get('thumbstick', {})
-        if thumb:
-            thumb_x = thumb.get('x', 0)
-            thumb_y = thumb.get('y', 0)
-            if abs(thumb_x) > 0.2:
-                if thumb_x > 0:
-                    pressed_keys.add('o')  # Move backward
-                else:
-                    pressed_keys.add('u')  # Move forward
-            if abs(thumb_y) > 0.2:
-                if thumb_y > 0:
-                    pressed_keys.add('k')  # Move right
-                else:
-                    pressed_keys.add('i')  # Move backward
-    
-    # Convert to numpy array and get base action
-    keyboard_keys = np.array(list(pressed_keys))
-    base_action = robot._from_keyboard_to_base_action(keyboard_keys) or {}
-    
-    return base_action
+class SimpleBaseControl:
+    def __init__(self, initial_obs: dict[str, Any], config: XLerobotVRTeleopConfig):
+        self.kp = config.base_kp
+        self.config = config
+        self.target_velocities = {
+            "x.vel": float(initial_obs.get("x.vel", 0.0)),
+            "y.vel": float(initial_obs.get("y.vel", 0.0)),
+            "theta.vel": float(initial_obs.get("theta.vel", 0.0)),
+        }
+        self.zero_vel = {"x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0}
+
+    def handle_vr_input(self, vr_goal) -> None:
+        thumb = vr_goal.metadata.get("thumbstick", {}) if vr_goal else {}
+        buttons = vr_goal.metadata.get("buttons", {}) if vr_goal else {}
+        twist = vr_goal.metadata.get("twist", 0.0) if vr_goal else 0.0
+
+        thumb_x = thumb.get("x", 0.0)
+        thumb_y = thumb.get("y", 0.0)
+        deadzone = self.config.base_thumb_deadzone
+        step = self.config.base_step
+        theta_step = self.config.base_theta_step
+        multiplier = self.config.base_velocity_multiplier
+
+        self.target_velocities["y.vel"] = -thumb_x * step * multiplier if abs(thumb_x) > deadzone else 0.0
+        self.target_velocities["x.vel"] = -thumb_y * step * multiplier if abs(thumb_y) > deadzone else 0.0
+        self.target_velocities["theta.vel"] = twist * theta_step * multiplier if abs(twist) > deadzone else 0.0
+
+        if buttons.get("a", False):
+            self.target_velocities["theta.vel"] = -theta_step
+        if buttons.get("b", False):
+            self.target_velocities["theta.vel"] = theta_step
+
+    def move_to_zero_velocity(self) -> dict[str, float]:
+        self.target_velocities = self.zero_vel.copy()
+        return self.zero_vel.copy()
+
+    def p_control_action(self, robot_obs: dict[str, Any]) -> dict[str, float]:
+        action = {}
+        for key, target in self.target_velocities.items():
+            current = float(robot_obs.get(key, 0.0))
+            action[key] = current + self.kp * (target - current)
+        return action
+
+
+class VREventHandler:
+    def __init__(self, config: XLerobotVRTeleopConfig):
+        self.events = {
+            "exit_early": False,
+            "rerecord_episode": False,
+            "stop_recording": False,
+            "reset_position": False,
+        }
+        self.threshold = config.event_thumb_threshold
+        self.reset_zone = config.event_thumb_reset_zone
+        self.axis_margin = config.event_thumb_axis_margin
+        self.armed = True
+
+    def process_left_controller(self, metadata: dict[str, Any]) -> None:
+        thumb = metadata.get("thumbstick", {})
+        thumb_x = thumb.get("x", 0.0)
+        thumb_y = thumb.get("y", 0.0)
+        abs_x = abs(thumb_x)
+        abs_y = abs(thumb_y)
+
+        if abs_x < self.reset_zone and abs_y < self.reset_zone:
+            self.armed = True
+            self.events["reset_position"] = False
+            return
+
+        if not self.armed:
+            self.events["reset_position"] = False
+            return
+
+        # Trigger only on clear cardinal directions.
+        # If both axes are too close, treat as diagonal/ambiguous and ignore.
+        if abs_x >= self.threshold or abs_y >= self.threshold:
+            if abs(abs_x - abs_y) < self.axis_margin:
+                self.events["reset_position"] = False
+                return
+
+        if abs_x > abs_y and abs_x >= self.threshold:
+            if thumb_x > 0:
+                # End current episode early and keep recording next episodes.
+                self.events["exit_early"] = True
+                logger.info("[VR Event] End current episode early requested.")
+            else:
+                # Re-record current episode.
+                self.events["rerecord_episode"] = True
+                self.events["exit_early"] = True
+                logger.info("[VR Event] Re-record current episode requested.")
+            self.armed = False
+            self.events["reset_position"] = False
+            return
+
+        if abs_y > abs_x and abs_y >= self.threshold:
+            if thumb_y < 0:
+                self.events["reset_position"] = True
+                logger.info("[VR Event] Reset robot position requested.")
+            else:
+                # Stop recording and discard current in-progress episode.
+                self.events["stop_recording"] = True
+                self.events["rerecord_episode"] = True
+                self.events["exit_early"] = True
+                logger.info("[VR Event] Stop recording and discard current episode requested.")
+            self.armed = False
+            return
+
+        self.events["reset_position"] = False
+
+    def get_events(self) -> dict[str, bool]:
+        return self.events.copy()
+
+    def reset_latched_events(self) -> None:
+        self.events["exit_early"] = False
+        self.events["rerecord_episode"] = False
+        self.events["stop_recording"] = False
+        self.events["reset_position"] = False
+
 
 class XLerobotVRTeleop(Teleoperator):
-    """
-    XLerobot VR Teleoperator class
-    Following the format of teleop_keyboard, integrating VR control logic from 8_xlerobot_VR_teleop.py
-    """
-
     config_class = XLerobotVRTeleopConfig
     name = "xlerobot_vr"
 
     def __init__(self, config: XLerobotVRTeleopConfig):
         super().__init__(config)
         self.config = config
-        
-        # VR system related
         self.vr_monitor = None
         self.vr_thread = None
-        self.vr_data_queue = Queue()
-        self.latest_vr_data = None
-        
-        # New: VR event handler
-        self.vr_event_handler = None
-                    
-        # Kinematics instances
-        self.kin_left = SO101Kinematics()
-        self.kin_right = SO101Kinematics()
-        
-        # Base speed control
-        self.current_base_speed = 0.0
-        self.last_update_time = time.time()
-        self.last_event_update_time = 0.0
-        self.is_accelerating = False
-        
-        # Status flags
+        self.logs = {}
         self._connected = False
         self._calibrated = False
-        
-        self.logs = {}
+        self.latest_robot_obs: dict[str, Any] | None = None
+        self.primary_arm: SimpleTeleopArm | None = None
+        self.left_arm: SimpleTeleopArm | None = None
+        self.right_arm: SimpleTeleopArm | None = None
+        self.head_control: SimpleHeadControl | None = None
+        self.base_control: SimpleBaseControl | None = None
+        self.vr_event_handler = VREventHandler(config)
+
+    def _resolve_controlled_arm(self) -> tuple[dict[str, str], str]:
+        if self.latest_robot_obs is None:
+            raise RuntimeError("No robot observation available yet.")
+
+        preferred_side = (self.config.arm_controller or "right").lower()
+        if preferred_side not in {"left", "right"}:
+            raise ValueError(
+                f"Unsupported arm_controller={self.config.arm_controller!r}. Expected 'left' or 'right'."
+            )
+
+        errors: list[str] = []
+        for side in (preferred_side, "left" if preferred_side == "right" else "right"):
+            try:
+                return resolve_arm_joint_map(self.latest_robot_obs, side), side
+            except RuntimeError as exc:
+                errors.append(str(exc))
+
+        try:
+            return resolve_arm_joint_map(self.latest_robot_obs, None), preferred_side
+        except RuntimeError as exc:
+            errors.append(str(exc))
+
+        raise RuntimeError(" ; ".join(errors))
 
     @property
-    def action_features(self) -> dict:
-        """Define action feature structure"""
-        # Define based on XLerobot's action space
-        # Including dual arm joints, head motors, base movement
-        features = {}
-        
-        # Left arm joints
-        for joint_name in LEFT_JOINT_MAP.values():
-            features[f"{joint_name}.pos"] = "float32"
-        
-        # Right arm joints
-        for joint_name in RIGHT_JOINT_MAP.values():
-            features[f"{joint_name}.pos"] = "float32"
-            
-        # Head motors
-        for motor_name in HEAD_MOTOR_MAP.values():
-            features[f"{motor_name}.pos"] = "float32"
-            
-        # Base control (according to XLerobot's base control method)
-        features["base_action"] = "dict"
-        
-        return features
+    def action_features(self) -> dict[str, type]:
+        return STATE_FEATURES.copy()
 
     @property
-    def feedback_features(self) -> dict:
-        """Define feedback feature structure"""
-        return {}  # VR controllers usually don't need feedback
+    def feedback_features(self) -> dict[str, type]:
+        return STATE_FEATURES.copy()
 
     @property
     def is_connected(self) -> bool:
-        """Check connection status"""
-        return (
-            self._connected and 
-            VR_AVAILABLE and 
-            self.vr_monitor is not None and
-            (self.vr_thread is not None and self.vr_thread.is_alive())
-        )
+        return self._connected and self.vr_monitor is not None and self.vr_thread is not None and self.vr_thread.is_alive()
 
     @property
     def is_calibrated(self) -> bool:
-        """Check calibration status"""
         return self._calibrated
 
-    def connect(self, calibrate: bool = True, robot=None) -> None:
-        """Establish VR connection and block until VR browser connects."""
+    def connect(self, calibrate: bool = True) -> None:
         if self.is_connected:
-            raise RuntimeError("XLerobot VR is already connected. Do not run `connect()` twice.")
-
+            raise RuntimeError("XLerobot VR is already connected.")
         if not VR_AVAILABLE:
-            raise RuntimeError("VR Monitor is not available. Please check VR system installation.")
+            raise RuntimeError("VR Monitor is not available. Please check VR runtime.")
 
-        try:
-            logger.info("🔧 Initializing VR monitor...")
-            self.vr_monitor = VRMonitor()
+        self.vr_monitor = VRMonitor()
+        if not self.vr_monitor.initialize():
+            raise RuntimeError("VR monitor initialization failed")
 
-            # Initialize VRMonitor (with timeout)
-            init_success = False
-            start_time = time.time()
-            timeout = 10.0
+        self.vr_thread = threading.Thread(
+            target=lambda: asyncio.run(self.vr_monitor.start_monitoring()),
+            daemon=True,
+        )
+        self.vr_thread.start()
 
-            while time.time() - start_time < timeout:
-                if self.vr_monitor.initialize():
-                    init_success = True
-                    break
-                time.sleep(0.1)
+        wait_start = time.time()
+        while time.time() - wait_start < self.config.vr_connection_timeout:
+            goals = self.vr_monitor.get_latest_goal_nowait()
+            if goals and any(
+                goal is not None and getattr(goal, "target_position", None) is not None
+                for goal in (goals.get("left"), goals.get("right"))
+            ):
+                self._connected = True
+                break
+            time.sleep(0.1)
 
-            if not init_success:
-                raise RuntimeError("VR monitor initialization timeout")
+        if not self._connected:
+            raise RuntimeError("VR client connection timeout. Please open the VR page first.")
 
-            logger.info("🚀 Starting VR monitoring thread...")
-            self.vr_thread = threading.Thread(
-                target=lambda: asyncio.run(self.vr_monitor.start_monitoring()),
-                daemon=True
-            )
-            self.vr_thread.start()
+        if calibrate and self.latest_robot_obs is not None:
+            self.calibrate()
 
-            # Wait for VRMonitor thread to start
-            time.sleep(0.5)
-            if not self.vr_thread.is_alive():
-                raise RuntimeError("VR monitoring thread failed to start")
+    def calibrate(self) -> None:
+        if self.latest_robot_obs is None:
+            raise RuntimeError("No robot observation available yet. Call send_feedback() before calibration.")
 
-            logger.info("✅ VR system ready")
+        self.left_arm = None
+        self.right_arm = None
 
-            # Initialize event handler
-            self.vr_event_handler = VREventHandler(self.vr_monitor)
-            logger.info("🎮 VR event handler initialized")
+        controlled_joint_map, controlled_prefix = self._resolve_controlled_arm()
+        self.primary_arm = SimpleTeleopArm(
+            controlled_joint_map,
+            self.latest_robot_obs,
+            SO101Kinematics(),
+            prefix=controlled_prefix,
+            config=self.config,
+        )
 
-            # ⭐ BLOCK HERE UNTIL VR BROWSER CONNECTS ⭐
-            logger.info("⏳ Waiting for VR client to connect...")
-
-            wait_start = time.time()
-            connect_timeout = 60  # seconds
-
-            while True:
-                goals = self.vr_monitor.get_latest_goal_nowait()
-                if goals and (goals.get("has_left") or goals.get("has_right") or goals.get("has_headset")):
-                    logger.info("🎉 VR client connected!")
-                    break
-
-                if time.time() - wait_start > connect_timeout:
-                    raise RuntimeError("VR client connection timeout. Please open the VR browser page.")
-
-                time.sleep(0.1)
-
-            # Calibration
-            if calibrate and robot is not None:
-                robot_obs = robot.get_observation(use_camera=False)
-                self.calibrate(robot_obs)
-
-            self._connected = True
-
-        except Exception as e:
-            logger.error(f"[VR] Connection failed: {e}")
-            self._connected = False
-            raise RuntimeError(f"Failed to connect to VR: {e}")
-
-    def calibrate(self, robot_obs: Optional[Dict] = None) -> None:
-        """Calibrate VR controllers - optimized version"""
-        if robot_obs is None:
-            logger.warning("[VR] No robot observation provided for calibration")
-            return
-            
-        try:
-            # Initialize arm controllers
+        has_dual_arm_obs = any(key.startswith("left_arm_") for key in self.latest_robot_obs) and any(
+            key.startswith("right_arm_") for key in self.latest_robot_obs
+        )
+        if has_dual_arm_obs and not self.config.single_arm_mode:
+            left_joint_map = resolve_arm_joint_map(self.latest_robot_obs, "left")
+            right_joint_map = resolve_arm_joint_map(self.latest_robot_obs, "right")
             self.left_arm = SimpleTeleopArm(
-                LEFT_JOINT_MAP, robot_obs, self.kin_left, 
-                prefix="left", kp=self.config.kp
+                left_joint_map,
+                self.latest_robot_obs,
+                SO101Kinematics(),
+                prefix="left",
+                config=self.config,
             )
             self.right_arm = SimpleTeleopArm(
-                RIGHT_JOINT_MAP, robot_obs, self.kin_right, 
-                prefix="right", kp=self.config.kp
+                right_joint_map,
+                self.latest_robot_obs,
+                SO101Kinematics(),
+                prefix="right",
+                config=self.config,
             )
-            
-            # Initialize head controller
-            self.head_control = SimpleHeadControl(robot_obs, kp=self.config.kp)
-            
-            logger.info("[VR] Controllers initialized successfully")
-            self._calibrated = True
-            
-        except Exception as e:
-            logger.error(f"[VR] Calibration failed: {e}")
-            self._calibrated = False
-            raise
-
-
-    def get_action(self, robot_obs: Optional[Dict] = None, robot = None) -> dict[str, Any]:
-        """Get VR control action - high-performance optimized version, parallel processing of events and actions"""
-        before_read_t = time.perf_counter()
-        
-        action = {}
-        
-        # Quick check VR monitoring status
-        if not self.vr_monitor:
-            self.logs["read_pos_dt_s"] = time.perf_counter() - before_read_t
-            return action
-        
-        # Get VR data once to avoid repeated calls
-        try:
-            dual_goals = self.vr_monitor.get_latest_goal_nowait()
-            if dual_goals is None:
-                self.logs["read_pos_dt_s"] = time.perf_counter() - before_read_t
-                return action
-                
-            left_goal = dual_goals.get("left")
-            right_goal = dual_goals.get("right")
-            
-        except Exception as e:
-            logger.warning(f"VR data acquisition failed: {e}")
-            self.logs["read_pos_dt_s"] = time.perf_counter() - before_read_t
-            return action
-        
-        # Parallel processing: robot control at high frequency, event processing at low frequency
-        if robot_obs is not None:
-            try:
-                current_time = time.perf_counter()
-                
-                # Robot control - high frequency execution (60Hz)
-                if left_goal is not None:
-                    self.left_arm.handle_vr_input(left_goal, None)
-                    
-                if right_goal is not None:
-                    self.right_arm.handle_vr_input(right_goal, None)
-                
-                # Event processing - low frequency execution (10Hz), only process when interval time is reached
-                if (current_time - self.last_event_update_time) >= 2:
-                    if left_goal is not None:
-                        self._update_events_inline(left_goal)
-                    self.last_event_update_time = current_time
-                
-                # Quickly generate action dictionary
-                left_action = self.left_arm.p_control_action(robot_obs)
-                right_action = self.right_arm.p_control_action(robot_obs)
-                head_action = self.head_control.p_control_action(robot_obs)
-                base_action = get_vr_base_action(right_goal, robot)
-                
-                # Efficiently merge actions
-                action.update(left_action)
-                action.update(right_action)
-                action.update(head_action)
-                action.update(base_action)
-                
-            except Exception as e:
-                logger.error(f"Action generation failed: {e}")
-            
-        self.logs["read_pos_dt_s"] = time.perf_counter() - before_read_t
-        return action
-
-    def _update_events_inline(self, left_goal):
-        """
-        Low frequency event update - 10Hz frequency, reuse already acquired left_goal data
-        Only execute when event interval time is reached, greatly reducing processing overhead
-        """
-        if not self.vr_event_handler or not left_goal or not hasattr(left_goal, 'metadata'):
-            return
-            
-        # Directly use already acquired data, no need to call VR interface again
-        try:
-            self.vr_event_handler._process_left_controller(left_goal.metadata)
-        except Exception as e:
-            logger.debug(f"Low frequency event update failed: {e}")  # Downgrade to debug to avoid disrupting main flow
-
-    def send_feedback(self) -> None:
-        """Send feedback - optimized version, reduce blocking wait"""
-        if not self.vr_monitor:
-            logger.warning("VR monitor not available for feedback")
-            return
-
-        max_attempts = 200  # Maximum 200 attempts
-        attempt = 0
-        
-        while attempt < max_attempts:
-            try:
-                dual_goals = self.vr_monitor.get_latest_goal_nowait()
-                if dual_goals and sum(dual_goals.get('right').metadata['vr_position']):
-                    logger.info("VR controller data received")
-                    return
-                    
-            except Exception as e:
-                logger.warning(f"Error getting VR data: {e}")
-            
-            attempt += 1
-            logger.info(f'Waiting for VR controller data (attempt {attempt}/{max_attempts})')
-            time.sleep(0.5)  # Reduce wait time from 8 seconds to 0.5 seconds
-        
-        logger.warning("Timeout waiting for VR controller data")
+        elif controlled_prefix == "left":
+            self.left_arm = self.primary_arm
+        else:
+            self.right_arm = self.primary_arm
+        if (
+            self.config.enable_head
+            and "head_motor_1.pos" in self.latest_robot_obs
+            and "head_motor_2.pos" in self.latest_robot_obs
+        ):
+            self.head_control = SimpleHeadControl(self.latest_robot_obs, config=self.config)
+        else:
+            self.head_control = None
+        self.base_control = SimpleBaseControl(self.latest_robot_obs, config=self.config)
+        self._calibrated = True
 
     def configure(self) -> None:
         pass
 
-    def disconnect(self) -> None:
-        """Disconnect VR connection"""
-        if not self.is_connected:
-            raise RuntimeError(
-                "XLerobot VR is not connected."
-            )
-        
-        try:
-            if self.vr_monitor:
-                # VR Monitor usually runs in a thread, stop the thread
-                pass
-            
-            self._connected = False
-            self._calibrated = False
-            print("[VR] Disconnected")
-            
-        except Exception as e:
-            print(f"[VR] Error during disconnect: {e}")
+    def send_feedback(self, feedback: dict[str, Any]) -> None:
+        self.latest_robot_obs = feedback
+        if not self._calibrated:
+            self.calibrate()
 
-    def move_to_zero_position(self, robot):
-        """Move all controllers to zero position"""
-        robot_obs = robot.get_observation(use_camera=False)
+    def _read_goals(self):
+        if self.vr_monitor is None:
+            return None
+        try:
+            return self.vr_monitor.get_latest_goal_nowait()
+        except Exception as exc:
+            logger.debug(f"Failed to read VR goals: {exc}")
+            return None
+
+    def get_action(self) -> dict[str, Any]:
+        before_read_t = time.perf_counter()
+        if not self.is_connected or self.latest_robot_obs is None:
+            self.logs["read_pos_dt_s"] = time.perf_counter() - before_read_t
+            return {}
+
+        if not self._calibrated:
+            self.calibrate()
+
+        goals = self._read_goals()
+        if not goals:
+            self.logs["read_pos_dt_s"] = time.perf_counter() - before_read_t
+            return {}
+
+        left_goal = goals.get("left")
+        right_goal = goals.get("right")
+        controller_side = (self.config.arm_controller or "right").lower()
+        controller_goal = left_goal if controller_side == "left" else right_goal
+
+        # Event source selection:
+        # - Dual-arm mode keeps the historical behavior (left controller drives events).
+        # - Single-arm mode prioritizes the active controller, then falls back to left.
+        event_goal = None
+        if self.config.single_arm_mode:
+            if controller_goal is not None and hasattr(controller_goal, "metadata"):
+                event_goal = controller_goal
+            elif left_goal is not None and hasattr(left_goal, "metadata"):
+                event_goal = left_goal
+        elif left_goal is not None and hasattr(left_goal, "metadata"):
+            event_goal = left_goal
+
+        if event_goal is not None:
+            self.vr_event_handler.process_left_controller(event_goal.metadata)
+
+        if left_goal is not None and hasattr(left_goal, "metadata"):
+            if self.config.enable_left_hand and self.left_arm is not None and not self.config.single_arm_mode:
+                self.left_arm.handle_vr_input(left_goal)
+        if controller_goal is not None:
+            if self.config.single_arm_mode:
+                if self.primary_arm is not None:
+                    self.primary_arm.handle_vr_input(controller_goal)
+            elif controller_side == "right" and self.right_arm is not None:
+                self.right_arm.handle_vr_input(right_goal)
+            if self.head_control is not None and right_goal is not None:
+                self.head_control.handle_vr_input(right_goal)
+            if self.base_control is not None and right_goal is not None:
+                self.base_control.handle_vr_input(right_goal)
+
         action = {}
-        left_action = self.left_arm.move_to_zero_position(robot_obs)
-        right_action = self.right_arm.move_to_zero_position(robot_obs)
-        head_action = self.head_control.move_to_zero_position(robot_obs)
-        base_action = get_vr_base_action(None, robot)
-        action.update(left_action)
-        action.update(right_action)
-        action.update(head_action)
-        action.update(base_action)
+        if self.left_arm is not None and self.config.enable_left_hand:
+            action.update(self.left_arm.p_control_action(self.latest_robot_obs))
+        if self.config.single_arm_mode and self.primary_arm is not None and self.primary_arm is not self.left_arm:
+            action.update(self.primary_arm.p_control_action(self.latest_robot_obs))
+        if self.right_arm is not None and (not self.config.single_arm_mode or self.right_arm is not self.primary_arm):
+            action.update(self.right_arm.p_control_action(self.latest_robot_obs))
+        if self.head_control is not None:
+            action.update(self.head_control.p_control_action(self.latest_robot_obs))
+        if self.base_control is not None:
+            action.update(self.base_control.p_control_action(self.latest_robot_obs))
 
+        if self.vr_event_handler.get_events().get("reset_position", False):
+            if self.left_arm is not None and self.config.enable_left_hand:
+                action.update(self.left_arm.move_to_zero_position())
+            if self.config.single_arm_mode and self.primary_arm is not None and self.primary_arm is not self.left_arm:
+                action.update(self.primary_arm.move_to_zero_position())
+            if self.right_arm is not None and (not self.config.single_arm_mode or self.right_arm is not self.primary_arm):
+                action.update(self.right_arm.move_to_zero_position())
+            if self.head_control is not None:
+                action.update(self.head_control.move_to_zero_position())
+            if self.base_control is not None:
+                action.update(self.base_control.move_to_zero_velocity())
+
+        self.logs["read_pos_dt_s"] = time.perf_counter() - before_read_t
         return action
-    
-    def get_vr_events(self):
-        """Get VR event status (high-performance version - use cache to avoid repeated VR data acquisition)"""
-        if self.vr_event_handler:
-            # Get current event status
-            events = self.vr_event_handler.get_events()
-            
-            # Automatically reset one-time events to prevent infinite loops
-            # Only reset when event is True to avoid affecting normal state
-            if events.get("exit_early", False) or events.get("rerecord_episode", False):
-                self.vr_event_handler.reset_events()
-            
-            return events
-        else:
-            # Return default event status
-            return {
-                "exit_early": False,
-                "rerecord_episode": False,
-                "stop_recording": False,
-                "reset_position": False,
-                "back_position": False,
-            }
-    
-    def reset_vr_events(self):
-        """Reset VR event status"""
-        if self.vr_event_handler:
-            self.vr_event_handler.reset_events()
-    
-    def print_vr_control_guide(self):
-        """Print VR control guide"""
-        if self.vr_event_handler:
-            self.vr_event_handler.print_control_guide()
-        else:
-            logger.info("VR event handler not initialized")
 
+    def get_teleop_events(self) -> dict[str, bool]:
+        events = self.vr_event_handler.get_events()
+        self.vr_event_handler.reset_latched_events()
+        return events
 
-def init_vr_listener(teleop_vr):
-    """
-    Initialize VR listener, providing the same interface as init_keyboard_listener
-    Used to replace keyboard event listening, used in record.py
-    
-    Args:
-        teleop_vr: XLerobotVRTeleop instance
-        
-    Returns:
-        tuple: (listener, events) - same return format as init_keyboard_listener
-    """
-    if not isinstance(teleop_vr, XLerobotVRTeleop):
-        logger.error("teleop_vr must be an XLerobotVRTeleop instance")
-        return None, {
-            "exit_early": False,
-            "rerecord_episode": False,
-            "stop_recording": False,
-            "reset_position": False,
-            "back_position": False,
-        }
-    
-    # Print control guide
-    teleop_vr.print_vr_control_guide()
-    
-    # Create virtual listener object (compatible with keyboard listener)
-    class VRListener:
-        def __init__(self, teleop_vr):
-            self.teleop_vr = teleop_vr
-            self.is_alive = True
-            
-        def stop(self):
-            self.is_alive = False
-            logger.info("VR listener stopped")
-    
-    vr_listener = VRListener(teleop_vr)
-    
-    # Get initial event status
-    events = teleop_vr.get_vr_events()
-    
-    return vr_listener, events
+    def send_feedback_wait(self) -> None:
+        return None
 
-class VREventHandler:
-    """
-    VR event handler, specifically handles recording control events
-    Use left VR controller to replace keyboard control
-    """
-    
-    def __init__(self, vr_monitor):
-        self.vr_monitor = vr_monitor
-        self.events = {
-            "exit_early": False,      # Left controller right: Exit loop early (original right arrow key)
-            "rerecord_episode": False, # Left controller left: Re-record episode (original left arrow key)
-            "stop_recording": False,   # Left controller up: Stop recording (original ESC key)
-            "reset_position": False,   # Left controller down: Reset robot (new feature)
-            "back_position": False,    # In the bucket (new feature)
-        }
-        self.prev_states = {
-            'thumbstick_x': 0,
-            'thumbstick_y': 0,
-            'trigger': False,
-            'button_a': False,
-            'button_b': False,
-        }
-        self.threshold = 0.7  # Thumbstick trigger threshold
-        
-    def update_events(self):
-        """Update VR event status"""
-        if not self.vr_monitor:
-            return self.events
-            
-        try:
-            dual_goals = self.vr_monitor.get_latest_goal_nowait()
-            if not dual_goals:
-                return self.events
-                
-            left_goal = dual_goals.get("left")
-            if not left_goal or not hasattr(left_goal, 'metadata'):
-                return self.events
-                
-            self._process_left_controller(left_goal.metadata)
-            
-        except Exception as e:
-            logger.error(f"VR事件更新失败: {e}")
-            
-        return self.events
-    
-    def _process_left_controller(self, metadata):
-        """处理左手柄输入"""
-        # 获取摇杆输入
-        thumb = metadata.get('thumbstick', {})
-        thumb_x = thumb.get('x', 0)
-        thumb_y = thumb.get('y', 0)
-
-        
-        # Detect thumbstick direction events (only trigger when crossing threshold)
-        if thumb_x > self.threshold and self.prev_states['thumbstick_x'] <= self.threshold:
-            logger.info("🎮 VR left controller right -> Exit loop early")
-            self.events["exit_early"] = True
-            
-        elif thumb_x < -self.threshold or self.events['rerecord_episode'] == True:
-            logger.info("🎮 VR left controller left -> Re-record episode")
-            self.events["rerecord_episode"] = True
-            self.events["exit_early"] = True
-            
-        if thumb_y > self.threshold and self.prev_states['thumbstick_y'] <= self.threshold:
-            logger.info("🎮 VR left controller up -> Stop recording")
-            self.events["stop_recording"] = True
-            self.events["exit_early"] = True
-            # self.events["back_position"] = True
-
-        elif thumb_y < -self.threshold and self.prev_states['thumbstick_y'] >= -self.threshold:
-            logger.info("🎮 VR left controller down -> Reset robot")
-            self.events["reset_position"] = True
-        else:
-            self.events["reset_position"] = False  # Reset event is instantaneous
-            self.events["back_position"] = False
-        
-        # Detect trigger key events
-        trigger = metadata.get('trigger', 0) > 0.5
-        
-        # Update status
-        self.prev_states.update({
-            'thumbstick_x': thumb_x,
-            'thumbstick_y': thumb_y,
-            'trigger': trigger,
-        })
-    
-    def reset_events(self):
-        """Reset all event status"""
-        for key in self.events:
-            self.events[key] = False
-    
-    def get_events(self):
-        """Get current event status"""
-        return self.events.copy()
-    
-    def print_control_guide(self):
-        """Print VR control guide"""
-        guide = """
-        🎮 VR Left Controller Guide:
-        ├── 👈 Push thumbstick left: Re-record current episode
-        ├── 👉 Push thumbstick right: Exit current loop early
-        ├── 👆 Push thumbstick up: Stop recording
-        ├── 👇 Push thumbstick down: Reset robot position
-        """
-        logger.info(guide)
+    def disconnect(self) -> None:
+        self._connected = False
+        self._calibrated = False
+        logger.info("[VR] Disconnected")

@@ -83,6 +83,10 @@ def make_teleoperator_from_config(config: TeleoperatorConfig) -> "Teleoperator":
         from .bi_so_leader import BiSOLeader
 
         return BiSOLeader(config)
+    elif config.type == "xlerobot_vr":
+        from .xlerobot_vr import XLerobotVRTeleop
+
+        return XLerobotVRTeleop(config)
     elif config.type == "xlebi_so101_leader":
         from .xlebi_so101_leader import XleBiSO101Leader
         return XleBiSO101Leader(config)

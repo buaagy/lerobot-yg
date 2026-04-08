@@ -100,6 +100,7 @@ from lerobot.teleoperators import (  # noqa: F401
     reachy2_teleoperator,
     so_leader,
     unitree_g1,
+    xlerobot_vr
 )
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.robot_utils import precise_sleep
@@ -169,6 +170,9 @@ def teleop_loop(
 
         # Get teleop action
         raw_action = teleop.get_action()
+        if not raw_action:
+            precise_sleep(max(1 / fps - (time.perf_counter() - loop_start), 0.0))
+            continue
 
         # Process teleop action through pipeline
         teleop_action = teleop_action_processor((raw_action, obs))

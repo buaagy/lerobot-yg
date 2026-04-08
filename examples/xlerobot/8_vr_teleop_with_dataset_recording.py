@@ -491,69 +491,22 @@ def init_dataset(robot, resume=True):
     """
     init dataset
     """
-    if ENABLE_LEFT_HAND:
-        features = {
-            "action": {
-                "dtype": "float32",
-                "shape": (17,),
-                "names": [
-                    # left arm (6)
-                    "left_arm_shoulder_pan.pos", "left_arm_shoulder_lift.pos", "left_arm_elbow_flex.pos",
-                    "left_arm_wrist_flex.pos", "left_arm_wrist_roll.pos", "left_arm_gripper.pos",
+    state_names = list(robot.action_features.keys())
+    if not ENABLE_LEFT_HAND:
+        state_names = [name for name in state_names if not name.startswith("left_arm_")]
 
-                    # right arm (6)
-                    "right_arm_shoulder_pan.pos", "right_arm_shoulder_lift.pos", "right_arm_elbow_flex.pos",
-                    "right_arm_wrist_flex.pos", "right_arm_wrist_roll.pos", "right_arm_gripper.pos",
-
-                    # head (2)
-                    "head_motor_1.pos", "head_motor_2.pos",
-
-                    # base (3)
-                    "x.vel", "y.vel", "theta.vel",
-                ]
-            },
-            "observation.state": {
-                "dtype": "float32",
-                "shape": (17,),
-                "names": [
-                    "left_arm_shoulder_pan.pos", "left_arm_shoulder_lift.pos", "left_arm_elbow_flex.pos",
-                    "left_arm_wrist_flex.pos", "left_arm_wrist_roll.pos", "left_arm_gripper.pos",
-                    "right_arm_shoulder_pan.pos", "right_arm_shoulder_lift.pos", "right_arm_elbow_flex.pos",
-                    "right_arm_wrist_flex.pos", "right_arm_wrist_roll.pos", "right_arm_gripper.pos",
-                    "head_motor_1.pos", "head_motor_2.pos",
-                    "x.vel", "y.vel", "theta.vel",
-                ]
-            },
-        }
-    else:
-        features = {
-            "action": {
-                "dtype": "float32",
-                "shape": (11,),
-                "names": [
-                    # right arm (6)
-                    "right_arm_shoulder_pan.pos", "right_arm_shoulder_lift.pos", "right_arm_elbow_flex.pos",
-                    "right_arm_wrist_flex.pos", "right_arm_wrist_roll.pos", "right_arm_gripper.pos",
-
-                    # head (2)
-                    "head_yaw.pos", "head_pitch.pos",
-
-                    # base (3)
-                    "x.vel", "y.vel", "theta.vel",
-                ]
-            },
-            "observation.state": {
-                "dtype": "float32",
-                "shape": (11,),
-                "names": [
-                    "right_arm_shoulder_pan.pos", "right_arm_shoulder_lift.pos", "right_arm_elbow_flex.pos",
-                    "right_arm_wrist_flex.pos", "right_arm_wrist_roll.pos", "right_arm_gripper.pos",
-                    "head_yaw.pos", "head_pitch.pos",
-                    "x.vel", "y.vel", "theta.vel",
-                ]
-            },
-        }
-
+    features = {
+        "action": {
+            "dtype": "float32",
+            "shape": (len(state_names),),
+            "names": state_names,
+        },
+        "observation.state": {
+            "dtype": "float32",
+            "shape": (len(state_names),),
+            "names": state_names,
+        },
+    }
     camera_features = hw_to_dataset_features(robot._cameras_ft, OBS_STR)
     features = {**features, **camera_features}
 
