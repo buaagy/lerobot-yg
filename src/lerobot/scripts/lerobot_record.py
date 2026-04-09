@@ -448,7 +448,6 @@ def record_loop(
 
         timestamp = time.perf_counter() - start_episode_t
 
-
 @parser.wrap()
 def record(cfg: RecordConfig) -> LeRobotDataset:
     init_logging()
@@ -483,6 +482,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
     dataset = None
     listener = None
+    primary_error: Exception | None = None
 
     try:
         if cfg.resume:
@@ -547,9 +547,23 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             )
 
         with VideoEncodingManager(dataset):
+            start_episode_index = dataset.num_episodes
+            target_episode_count = start_episode_index + cfg.dataset.num_episodes
+            if cfg.resume:
+                logging.info(
+                    "Resuming dataset from episode %d. Planned total after this run: %d episodes.",
+                    start_episode_index,
+                    target_episode_count,
+                )
+
             recorded_episodes = 0
             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
-                log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
+                current_episode_index = dataset.num_episodes
+                current_episode_number = current_episode_index + 1
+                log_say(
+                    f"Recording episode {current_episode_number}/{target_episode_count}",
+                    cfg.play_sounds,
+                )
                 record_loop(
                     robot=robot,
                     events=events,
@@ -574,7 +588,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     cfg.dataset.reset_time_s > 0
                     and not events["stop_recording"]
                     and (
-                    (recorded_episodes < cfg.dataset.num_episodes - 1) or events["rerecord_episode"]
+                        (recorded_episodes < cfg.dataset.num_episodes - 1) or events["rerecord_episode"]
                     )
                 ):
                     log_say("Reset the environment", cfg.play_sounds)
@@ -600,24 +614,50 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     continue
                 dataset.save_episode()
                 recorded_episodes += 1
+    except Exception as exc:
+        primary_error = exc
+        raise
     finally:
+        cleanup_errors = []
         log_say("Stop recording", cfg.play_sounds, blocking=True)
 
         if dataset:
-            dataset.finalize()
+            try:
+                dataset.finalize()
+            except Exception as exc:
+                cleanup_errors.append(exc)
+                logging.exception("Failed to finalize dataset during shutdown.")
 
         if robot.is_connected:
-            robot.disconnect()
+            try:
+                robot.disconnect()
+            except Exception as exc:
+                cleanup_errors.append(exc)
+                logging.exception("Failed to disconnect robot cleanly during shutdown.")
         if teleop and teleop.is_connected:
-            teleop.disconnect()
+            try:
+                teleop.disconnect()
+            except Exception as exc:
+                cleanup_errors.append(exc)
+                logging.exception("Failed to disconnect teleoperator cleanly during shutdown.")
 
         if not is_headless() and listener:
-            listener.stop()
+            try:
+                listener.stop()
+            except Exception as exc:
+                cleanup_errors.append(exc)
+                logging.exception("Failed to stop keyboard listener during shutdown.")
 
-        if cfg.dataset.push_to_hub:
-            dataset.push_to_hub(tags=cfg.dataset.tags, private=cfg.dataset.private)
+        if dataset and cfg.dataset.push_to_hub:
+            try:
+                dataset.push_to_hub(tags=cfg.dataset.tags, private=cfg.dataset.private)
+            except Exception as exc:
+                cleanup_errors.append(exc)
+                logging.exception("Failed to push dataset to hub during shutdown.")
 
         log_say("Exiting", cfg.play_sounds)
+        if cleanup_errors and primary_error is None:
+            raise cleanup_errors[0]
     return dataset
 
 

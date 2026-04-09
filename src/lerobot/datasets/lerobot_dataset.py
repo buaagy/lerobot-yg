@@ -37,7 +37,7 @@ from lerobot.datasets.video_utils import (
     get_safe_default_codec,
     resolve_vcodec,
 )
-from lerobot.utils.constants import HF_LEROBOT_HUB_CACHE
+from lerobot.utils.constants import HF_LEROBOT_HOME, HF_LEROBOT_HUB_CACHE
 
 logger = logging.getLogger(__name__)
 
@@ -743,11 +743,15 @@ class LeRobotDataset(torch.utils.data.Dataset):
             A :class:`LeRobotDataset` in write mode, ready to append episodes.
         """
         if not root:
-            raise ValueError(
-                "resume() requires an explicit 'root' directory because it creates a DatasetWriter. "
-                "Writing into the revision-safe Hub snapshot cache (used when root=None) would corrupt "
-                "the shared cache. Please provide a local directory path."
-            )
+            default_root = HF_LEROBOT_HOME / repo_id
+            if (default_root / "meta" / "info.json").is_file():
+                root = default_root
+            else:
+                raise ValueError(
+                    "resume() requires an explicit 'root' directory because it creates a DatasetWriter. "
+                    "Writing into the revision-safe Hub snapshot cache (used when root=None) would corrupt "
+                    "the shared cache. Please provide a local directory path."
+                )
         vcodec = resolve_vcodec(vcodec)
         obj = cls.__new__(cls)
         obj.repo_id = repo_id
