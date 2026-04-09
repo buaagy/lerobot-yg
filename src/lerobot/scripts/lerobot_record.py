@@ -163,9 +163,9 @@ class DatasetRecordConfig:
     # Limit the frames per second.
     fps: int = 30
     # Number of seconds for data recording for each episode.
-    episode_time_s: int | float = 60
+    episode_time_s: int | float = 180
     # Number of seconds for resetting the environment after each episode.
-    reset_time_s: int | float = 60
+    reset_time_s: int | float = 0
     # Number of episodes to record.
     num_episodes: int = 50
     # Encode frames in the dataset into video
@@ -570,8 +570,12 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
                 # Execute a few seconds without recording to give time to manually reset the environment
                 # Skip reset for the last episode to be recorded
-                if not events["stop_recording"] and (
+                if (
+                    cfg.dataset.reset_time_s > 0
+                    and not events["stop_recording"]
+                    and (
                     (recorded_episodes < cfg.dataset.num_episodes - 1) or events["rerecord_episode"]
+                    )
                 ):
                     log_say("Reset the environment", cfg.play_sounds)
 
