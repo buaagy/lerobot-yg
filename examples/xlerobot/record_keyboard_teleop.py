@@ -39,7 +39,7 @@ import platform
 import numpy as np
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.datasets.utils import build_dataset_frame, hw_to_dataset_features
+from lerobot.datasets.feature_utils import build_dataset_frame, hw_to_dataset_features
 from lerobot.model.SO101Robot import SO101Kinematics
 from lerobot.processor import make_default_processors
 from lerobot.robots.xlerobot.xlerobot_client import XLerobotClient
