@@ -35,6 +35,8 @@ from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
 
 logger = logging.getLogger(__name__)
 
+HEAD_STEP_SIZE = 5.0
+
 NUM_EPISODES = 50
 FPS = 30
 EPISODE_TIME_SEC = 300
@@ -90,6 +92,7 @@ def record_loop(
     # One loop iteration corresponds to one recorded control step.
     timestamp = 0.0
     start_episode_t = time.perf_counter()
+    head_positions = {keyboard.id: {"head_motor_1.pos": 0.0, "head_motor_2.pos": 0.0}}
 
     while timestamp < control_time_s:
         start_loop_t = time.perf_counter()
@@ -113,7 +116,20 @@ def record_loop(
         leader_action = map_bi_leader_action_to_xlerobot(leader.get_action())
         pressed_keys = np.array(list(keyboard.get_action().keys()))
         base_action = robot._from_keyboard_to_base_action(pressed_keys) or {}
-        act = {**leader_action, **base_action}
+
+        # Head motors are controlled via keyboard: < / > for head_motor_1, , / . for head_motor_2.
+        head_pos = head_positions[keyboard.id]
+        if "<" in pressed_keys:
+            head_pos["head_motor_1.pos"] += HEAD_STEP_SIZE
+        if ">" in pressed_keys:
+            head_pos["head_motor_1.pos"] -= HEAD_STEP_SIZE
+        if "," in pressed_keys:
+            head_pos["head_motor_2.pos"] += HEAD_STEP_SIZE
+        if "." in pressed_keys:
+            head_pos["head_motor_2.pos"] -= HEAD_STEP_SIZE
+        head_positions[keyboard.id] = head_pos
+
+        act = {**leader_action, **base_action, **head_pos}
 
         # Keep the standard LeRobot processing hooks even though the default processors
         act_processed_teleop = teleop_action_processor((act, obs))
@@ -212,6 +228,7 @@ def main():
 
     print("Starting recording loop...")
     print("Base keys: i/k/j/l move, u/o rotate, n/m speed +/-, q quit")
+    print("Head keys: </> motor_1, ,/. motor_2")
     print("Listener keys: -> end episode, <- re-record episode, Esc stop recording")
 
     recorded_episodes = 0
