@@ -14,6 +14,7 @@
 
 from dataclasses import dataclass
 from pathlib import Path
+import platform
 
 from ..configs import CameraConfig, ColorMode, Cv2Backends, Cv2Rotation
 
@@ -63,7 +64,11 @@ class OpenCVCameraConfig(CameraConfig):
     rotation: Cv2Rotation = Cv2Rotation.NO_ROTATION
     warmup_s: int = 1
     fourcc: str | None = None
-    backend: Cv2Backends = Cv2Backends.ANY
+    backend: Cv2Backends = (
+        Cv2Backends.DSHOW if platform.system() == "Windows"
+        else Cv2Backends.V4L2 if platform.system() == "Linux"
+        else Cv2Backends.ANY
+    )
 
     def __post_init__(self) -> None:
         self.color_mode = ColorMode(self.color_mode)

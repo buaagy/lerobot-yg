@@ -156,7 +156,7 @@ class OpenCVCamera(Camera):
         # blocking in multi-threaded applications, especially during data collection.
         cv2.setNumThreads(1)
 
-        self.videocapture = cv2.VideoCapture(self.index_or_path)
+        self.videocapture = cv2.VideoCapture(self.index_or_path, self.backend)
 
         if not self.videocapture.isOpened():
             self.videocapture.release()
@@ -317,7 +317,13 @@ class OpenCVCamera(Camera):
             targets_to_scan = [int(i) for i in range(MAX_OPENCV_INDEX)]
 
         for target in targets_to_scan:
-            camera = cv2.VideoCapture(target)
+            if platform.system() == "Windows":
+                api_pref = cv2.CAP_DSHOW
+            elif platform.system() == "Linux":
+                api_pref = cv2.CAP_V4L2
+            else:
+                api_pref = cv2.CAP_ANY
+            camera = cv2.VideoCapture(target, api_pref)
             if camera.isOpened():
                 default_width = int(camera.get(cv2.CAP_PROP_FRAME_WIDTH))
                 default_height = int(camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
