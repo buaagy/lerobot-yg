@@ -59,7 +59,7 @@ class SOLeader(Teleoperator):
 
     @property
     def feedback_features(self) -> dict[str, type]:
-        return {}
+        return self.action_features
 
     @property
     def is_connected(self) -> bool:
@@ -130,6 +130,12 @@ class SOLeader(Teleoperator):
         self.bus.configure_motors()
         for motor in self.bus.motors:
             self.bus.write("Operating_Mode", motor, OperatingMode.POSITION.value)
+
+    def enable_torque(self) -> None:
+        self.bus.enable_torque()
+
+    def disable_torque(self) -> None:
+        self.bus.disable_torque()
 
     def setup_motors(self) -> None:
         expected_ids = [1]
@@ -287,9 +293,11 @@ class SOLeader(Teleoperator):
         logger.debug(f"{self} read action: {dt_ms:.1f}ms")
         return action
 
+    @check_if_not_connected
     def send_feedback(self, feedback: dict[str, float]) -> None:
-        # TODO: Implement force feedback
-        raise NotImplementedError
+        goals = {k.removesuffix(".pos"): v for k, v in feedback.items() if k.endswith(".pos")}
+        if goals:
+            self.bus.sync_write("Goal_Position", goals)
 
     @check_if_not_connected
     def disconnect(self) -> None:

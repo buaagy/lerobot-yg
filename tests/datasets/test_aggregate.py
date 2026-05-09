@@ -17,9 +17,11 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import datasets
-import pandas as pd
 import pytest
+
+pytest.importorskip("datasets", reason="datasets is required (install lerobot[dataset])")
+
+import datasets  # noqa: E402
 import torch
 
 from lerobot.datasets.aggregate import (
@@ -117,7 +119,7 @@ def assert_metadata_consistency(aggr_ds, ds_0, ds_1):
     """Test that metadata is correctly aggregated."""
     # Test basic info
     assert aggr_ds.fps == ds_0.fps == ds_1.fps, "FPS should be the same across all datasets"
-    assert aggr_ds.meta.info["robot_type"] == ds_0.meta.info["robot_type"] == ds_1.meta.info["robot_type"], (
+    assert aggr_ds.meta.info.robot_type == ds_0.meta.info.robot_type == ds_1.meta.info.robot_type, (
         "Robot type should be the same"
     )
 
@@ -157,8 +159,8 @@ def assert_video_frames_integrity(aggr_ds, ds_0, ds_1):
 
     video_keys = list(
         filter(
-            lambda key: aggr_ds.meta.info["features"][key]["dtype"] == "video",
-            aggr_ds.meta.info["features"].keys(),
+            lambda key: aggr_ds.meta.info.features[key]["dtype"] == "video",
+            aggr_ds.meta.info.features.keys(),
         )
     )
 
