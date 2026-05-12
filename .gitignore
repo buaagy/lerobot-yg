@@ -170,6 +170,9 @@ outputs/
 *.mo
 *.pot
 
+# Claude Code
+.claude/
+
 # Dev folders
 .cache/*
 *.stl
