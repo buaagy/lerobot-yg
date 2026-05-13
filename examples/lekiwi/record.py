@@ -20,7 +20,7 @@ from lerobot.processor import make_default_processors
 from lerobot.robots.lekiwi import LeKiwiClient, LeKiwiClientConfig
 from lerobot.scripts.lerobot_record import record_loop
 from lerobot.teleoperators.keyboard import KeyboardTeleop, KeyboardTeleopConfig
-from lerobot.teleoperators.so_leader import SO100Leader, SO100LeaderConfig
+from lerobot.teleoperators.so_leader import SO101Leader, SO101LeaderConfig
 from lerobot.utils.constants import ACTION, OBS_STR
 from lerobot.utils.feature_utils import hw_to_dataset_features
 from lerobot.utils.utils import log_say
