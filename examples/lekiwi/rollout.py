@@ -23,7 +23,7 @@ recording, upload, and human-in-the-loop variants, see ``lerobot-rollout``.
 """
 
 from lerobot.configs import PreTrainedConfig
-from lerobot.robots.lekiwi import LeKiwiClientConfig
+from lerobot.robots.lekiwi import LeKiwiClientConfig , LeKiwiConfig
 from lerobot.rollout import BaseStrategyConfig, RolloutConfig, build_rollout_context
 from lerobot.rollout.inference import SyncInferenceConfig
 from lerobot.rollout.strategies import BaseStrategy
@@ -40,7 +40,9 @@ def main():
     init_logging()
 
     # Robot: LeKiwi client — make sure lekiwi_host is already running on the robot.
-    robot_config = LeKiwiClientConfig(remote_ip="172.18.134.136", id="lekiwi")
+    robot_config = LeKiwiClientConfig(remote_ip="172.18.134.136", id="lekiwi") # remote
+    # robot_config = LeKiwiConfig(port="COM3",id="my_lekiwi")     # local
+
 
     # Policy: load the pretrained config.  ``pretrained_path`` is read downstream
     # by ``build_rollout_context`` to reload the full model.

@@ -23,7 +23,7 @@ from lerobot.policies import make_pre_post_processors
 from lerobot.policies.act import ACTPolicy
 from lerobot.policies.utils import make_robot_action
 from lerobot.processor import make_default_processors
-from lerobot.robots.lekiwi import LeKiwiClient, LeKiwiClientConfig
+from lerobot.robots.lekiwi import LeKiwiClient, LeKiwiClientConfig,LeKiwi,LeKiwiConfig
 from lerobot.utils.constants import ACTION, OBS_STR
 from lerobot.utils.feature_utils import build_dataset_frame, hw_to_dataset_features
 from lerobot.utils.robot_utils import precise_sleep
@@ -43,9 +43,12 @@ def main():
     # This script provides a self-contained example for educational purposes.
 
     # Create the robot configuration & robot
-    robot_config = LeKiwiClientConfig(remote_ip="192.168.200.66", id="R12254322")
+    robot_config = LeKiwiClientConfig(remote_ip="192.168.200.66", id="R12254322") # remote
+    # robot_config = LeKiwiConfig(port="COM3", id="LK12252710") # local
+    
 
-    robot = LeKiwiClient(robot_config)
+    robot = LeKiwiClient(robot_config) # remote
+    # robot = LeKiwi(robot_config) # local
 
     # Create policy
     policy = ACTPolicy.from_pretrained(HF_MODEL_ID)
