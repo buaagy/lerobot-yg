@@ -73,6 +73,13 @@ class LeKiwi(Robot):
         self.arm_motors = [motor for motor in self.bus.motors if motor.startswith("arm")]
         self.base_motors = [motor for motor in self.bus.motors if motor.startswith("base")]
         self.cameras = make_cameras_from_configs(config.cameras)
+        self.teleop_keys = config.teleop_keys
+        self.speed_levels = [
+            {"xy": 0.1, "theta": 30},
+            {"xy": 0.3, "theta": 60},
+            {"xy": 0.5, "theta": 90},
+        ]
+        self.speed_index = 0
 
     @property
     def _state_ft(self) -> dict[str, type]:
@@ -336,6 +343,39 @@ class LeKiwi(Robot):
             "y.vel": y,
             "theta.vel": theta,
         }  # m/s and deg/s
+
+    def _from_keyboard_to_base_action(self, pressed_keys: np.ndarray) -> RobotAction:
+        if self.teleop_keys["speed_up"] in pressed_keys:
+            self.speed_index = min(self.speed_index + 1, len(self.speed_levels) - 1)
+        if self.teleop_keys["speed_down"] in pressed_keys:
+            self.speed_index = max(self.speed_index - 1, 0)
+
+        speed_setting = self.speed_levels[self.speed_index]
+        xy_speed = speed_setting["xy"]
+        theta_speed = speed_setting["theta"]
+
+        x_cmd = 0.0
+        y_cmd = 0.0
+        theta_cmd = 0.0
+
+        if self.teleop_keys["forward"] in pressed_keys:
+            x_cmd += xy_speed
+        if self.teleop_keys["backward"] in pressed_keys:
+            x_cmd -= xy_speed
+        if self.teleop_keys["left"] in pressed_keys:
+            y_cmd += xy_speed
+        if self.teleop_keys["right"] in pressed_keys:
+            y_cmd -= xy_speed
+        if self.teleop_keys["rotate_left"] in pressed_keys:
+            theta_cmd += theta_speed
+        if self.teleop_keys["rotate_right"] in pressed_keys:
+            theta_cmd -= theta_speed
+
+        return {
+            "x.vel": x_cmd,
+            "y.vel": y_cmd,
+            "theta.vel": theta_cmd,
+        }
 
     @check_if_not_connected
     def get_observation(self) -> RobotObservation:
