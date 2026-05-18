@@ -38,6 +38,23 @@ class LeKiwiConfig(RobotConfig):
 
     disable_torque_on_disconnect: bool = True
 
+    teleop_keys: dict[str, str] = field(
+        default_factory=lambda: {
+            # Movement
+            "forward": "w",
+            "backward": "s",
+            "left": "a",
+            "right": "d",
+            "rotate_left": "z",
+            "rotate_right": "x",
+            # Speed control
+            "speed_up": "r",
+            "speed_down": "f",
+            # quit teleop
+            "quit": "q",
+        }
+    )
+
     # `max_relative_target` limits the magnitude of the relative positional target vector for safety purposes.
     # Set this to a positive scalar to have the same value for all motors, or a dictionary that maps motor
     # names to the max_relative_target value for that motor.

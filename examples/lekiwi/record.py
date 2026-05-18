@@ -14,16 +14,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.datasets.utils import hw_to_dataset_features
+from lerobot.common.control_utils import init_keyboard_listener
+from lerobot.datasets import LeRobotDataset
 from lerobot.processor import make_default_processors
-from lerobot.robots.lekiwi.config_lekiwi import LeKiwiClientConfig
-from lerobot.robots.lekiwi.lekiwi_client import LeKiwiClient
+from lerobot.robots.lekiwi import LeKiwiClient, LeKiwiClientConfig, LeKiwi, LeKiwiConfig
 from lerobot.scripts.lerobot_record import record_loop
 from lerobot.teleoperators.keyboard import KeyboardTeleop, KeyboardTeleopConfig
 from lerobot.teleoperators.so101_leader import SO101Leader, SO101LeaderConfig
 from lerobot.utils.constants import ACTION, OBS_STR
-from lerobot.utils.control_utils import init_keyboard_listener
+from lerobot.utils.feature_utils import hw_to_dataset_features
 from lerobot.utils.utils import log_say
 from lerobot.utils.visualization_utils import init_rerun
 import argparse
@@ -43,7 +42,9 @@ def main():
     resume = args.resume 
 
     # Create the robot and teleoperator configurations
-    robot_config = LeKiwiClientConfig(remote_ip="192.168.31.165", id="LK12252710")
+    robot_config = LeKiwiClientConfig(remote_ip="192.168.31.165", id="LK12252710") # remote
+    # robot_config = LeKiwiConfig(port="COM3",id="my_lekiwi")     # local
+
     # port in Linux: /dev/ttyACM0, /dev/ttyACM1, etc.
     # port in MacOS: /dev/tty.usbmodemXXXXXXXXXXXX
     # port in Windows: COMX / COMXX
@@ -51,12 +52,11 @@ def main():
     keyboard_config = KeyboardTeleopConfig()
 
     # Initialize the robot and teleoperator
-    robot = LeKiwiClient(robot_config)
+    robot = LeKiwiClient(robot_config)  # remote
+    #robot = LeKiwi(robot_config) # local
+
     leader_arm = SO101Leader(leader_arm_config)
     keyboard = KeyboardTeleop(keyboard_config)
-
-    # TODO(Steven): Update this example to use pipelines
-    teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()
 
     # Configure the dataset features
     action_features = hw_to_dataset_features(robot.action_features, ACTION)
@@ -99,11 +99,16 @@ def main():
     listener, events = init_keyboard_listener()
     init_rerun(session_name="lekiwi_record")
 
-    if not robot.is_connected or not leader_arm.is_connected or not keyboard.is_connected:
-        raise ValueError("Robot or teleop is not connected!")
-
-    print("Starting record loop...")
     try:
+        if not robot.is_connected or not leader_arm.is_connected or not keyboard.is_connected:
+            raise ValueError("Robot or teleop is not connected!")
+
+        teleop_action_processor, robot_action_processor, robot_observation_processor = (
+            make_default_processors()
+        )
+
+        print("Starting record loop...")
+        recorded_episodes = 0
         while recorded_episodes < NUM_EPISODES and not events["stop_recording"]:
             log_say(f"Recording episode {recorded_episodes}")
 
@@ -112,14 +117,14 @@ def main():
                 robot=robot,
                 events=events,
                 fps=FPS,
+                teleop_action_processor=teleop_action_processor,
+                robot_action_processor=robot_action_processor,
+                robot_observation_processor=robot_observation_processor,
                 dataset=dataset,
                 teleop=[leader_arm, keyboard],
                 control_time_s=EPISODE_TIME_SEC,
                 single_task=TASK_DESCRIPTION,
                 display_data=True,
-                teleop_action_processor=teleop_action_processor,
-                robot_action_processor=robot_action_processor,
-                robot_observation_processor=robot_observation_processor,
             )
 
             # Reset the environment if not stopping or re-recording
@@ -131,18 +136,14 @@ def main():
                     robot=robot,
                     events=events,
                     fps=FPS,
+                    teleop_action_processor=teleop_action_processor,
+                    robot_action_processor=robot_action_processor,
+                    robot_observation_processor=robot_observation_processor,
                     teleop=[leader_arm, keyboard],
                     control_time_s=RESET_TIME_SEC,
                     single_task=TASK_DESCRIPTION,
                     display_data=True,
-                    teleop_action_processor=teleop_action_processor,
-                    robot_action_processor=robot_action_processor,
-                    robot_observation_processor=robot_observation_processor,
                 )
-            if dataset.episode_buffer is None or dataset.episode_buffer.get("size", 0) == 0:
-                print("[WARN] Episode buffer empty, skip save")
-                dataset.clear_episode_buffer()
-                continue
 
             if events["rerecord_episode"]:
                 log_say("Re-record episode")
@@ -154,26 +155,16 @@ def main():
             # Save episode
             dataset.save_episode()
             recorded_episodes += 1
-            print(f"{recorded_episodes} is end ")
-    except KeyboardInterrupt :
-            print("[ERROR] Recording KeyboardInterrupt interrupted")
-            dataset.clear_episode_buffer()
-    except Exception as e:
-            print(f"[ERROR] Recording interrupted: {e}")
-            print("[INFO] Discarding current incomplete episode")
-            dataset.clear_episode_buffer()
     finally:
-        print("[INFO] Finalizing dataset (saving metadata)...")
-        dataset.clear_episode_buffer(delete_images=True)
-        dataset.finalize()
-        # Disable push to hub by default, uncomment to push to hub
-        # dataset.push_to_hub()
-
+        # Clean up
         log_say("Stop recording")
         robot.disconnect()
         leader_arm.disconnect()
         keyboard.disconnect()
-        listener.stop()         
+        listener.stop()
+
+        dataset.finalize()
+        dataset.push_to_hub()
 
 
 if __name__ == "__main__":
