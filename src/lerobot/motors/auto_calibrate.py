@@ -13,8 +13,11 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from pprint import pformat
+from threading import Event
+from typing import Protocol
 
-from serial.tools import list_ports
+import draccus
 
 from lerobot.motors import auto_calibrate as auto_calibrate_module
 from lerobot.motors.feetech import OperatingMode
@@ -72,852 +75,779 @@ except ImportError:
 
 
 logger = logging.getLogger(__name__)
+_CALIBRATION_PAUSED = Event()
 
-AutoCalibrateConfig = auto_calibrate_module.AutoCalibrateConfig
-auto_calibrate_connected_device = auto_calibrate_module.auto_calibrate_connected_device
-explore_literal_limit = auto_calibrate_module.explore_literal_limit
-get_joint_behavior = auto_calibrate_module.get_joint_behavior
-is_calibration_paused = getattr(auto_calibrate_module, "is_calibration_paused", lambda: False)
-set_calibration_paused = getattr(auto_calibrate_module, "set_calibration_paused", lambda paused: None)
+SERVO_RESOLUTION = 4096
+DEFAULT_CALIBRATION_ORDER = (
+    "elbow_flex",
+    "wrist_flex",
+    "wrist_roll",
+    "gripper",
+    "shoulder_pan",
+    "shoulder_lift",
+)
 
-IS_WINDOWS = sys.platform.startswith("win")
-IS_LINUX = sys.platform.startswith("linux")
-LINUX_PORT_PREFIX = "/dev/ttyACM"
 
-GRIPPER_CHECK_TORQUE = 300
-GRIPPER_CHECK_VELOCITY = 300
+class Direction(Enum):
+    """Direction used when exploring a mechanical limit."""
 
-DEVICE_CONFIG_FACTORIES = {
-    "tele": SO101LeaderConfig,
-    "robot": SO101FollowerConfig,
-}
+    CLOCKWISE = "clockwise"
+    ANTI_CLOCKWISE = "anti_clockwise"
 
-DEVICE_FACTORIES = {
-    "tele": make_teleoperator_from_config,
-    "robot": make_robot_from_config,
-}
 
-AUTO_CALIBRATION_DEFAULTS = {
-    "tele": {
-        "try_torque": 400,
-        "max_torque": 500,
-        "torque_step": 50,
-        "explore_velocity": 600,
-        "wait_time_s": 0.5,
-        "velocity_threshold": 4,
-        "position_tolerance": 4000,
-    },
-    "robot": {
-        "try_torque": 600,
-        "max_torque": 1000,
-        "torque_step": 50,
-        "explore_velocity": 800,
-        "wait_time_s": 0.5,
-        "velocity_threshold": 4,
-        "position_tolerance": 4000,
-    },
-}
+class CalibratableDevice(Protocol):
+    """Minimal device interface required by the calibration workflow."""
 
-STATUS_IDLE = "空闲中"
-STATUS_PORT_DETECTED = "检测到有外接端口"
-STATUS_CALIBRATING = "标定中"
-STATUS_PAUSED = "标定已暂停"
-STATUS_FINISHED = "标定完毕，请拔掉USB"
-STATUS_FAILED = "标定失败"
-STATUS_AUTHORIZING = "端口授权中"
-STATUS_CHECKING_ARM = "机械臂检测中"
-
-ACTIVE_STATUSES = {STATUS_IDLE, STATUS_PORT_DETECTED}
-BUSY_STATUSES = {STATUS_CALIBRATING, STATUS_PAUSED, STATUS_AUTHORIZING, STATUS_CHECKING_ARM}
-TERMINAL_STATUSES = {STATUS_FINISHED, STATUS_FAILED}
+    bus: FeetechMotorsBus
+    calibration_fpath: Path | str
+    name: str
 
 
 @dataclass(frozen=True)
-class SerialPortInfo:
-    device: str
-    description: str
-
-    @property
-    def label(self) -> str:
-        return f"{self.device}  |  {self.description}"
+class MotorAction:
+    motor_name: str
+    direction: Direction
 
 
-class LogEmitter(QObject):
-    message_emitted = Signal(str)
+@dataclass(frozen=True)
+class JointCalibrationBehavior:
+    first_direction: Direction = Direction.CLOCKWISE
+    second_direction: Direction = Direction.ANTI_CLOCKWISE
+    midpoint_velocity_sign: int = 1
+    midpoint_half_offset_adjustment: int = 0
+    use_closed_position_as_center: bool = False
+    stop_midpoint_motion_immediately: bool = False
 
 
-class QtLogHandler(logging.Handler):
-    def __init__(self):
-        super().__init__()
-        self.emitter = LogEmitter()
+@dataclass(frozen=True)
+class LimitExplorationResult:
+    first_offset: int
+    first_limit: int
+    second_offset: int
+    second_limit: int
 
-    def emit(self, record: logging.LogRecord):
-        self.emitter.message_emitted.emit(self.format(record))
+
+@dataclass(frozen=True)
+class RobotCalibrationPlan:
+    ordered_motors: tuple[str, ...]
+    recovery_order: tuple[str, ...]
+    pre_actions: dict[str, tuple[MotorAction, ...]] = field(default_factory=dict)
+    post_actions: dict[str, tuple[MotorAction, ...]] = field(default_factory=dict)
 
 
-def run_auto_calibration_for_ui(device, config: AutoCalibrateConfig, output_path: Path) -> Path:
-    """Run auto calibration across old/new helper signatures and return the saved file path."""
+@dataclass(frozen=True)
+class AutoCalibrateResult:
+    calibration_dict: dict[str, MotorCalibration]
+    calibration_path: Path | None = None
 
-    calibration_func = auto_calibrate_connected_device
-    save_calibration_to_file = getattr(auto_calibrate_module, "save_calibration_to_file", None)
+
+PRE_CALIBRATION_ACTIONS = {
+    "shoulder_lift": (
+        MotorAction("wrist_roll", Direction.ANTI_CLOCKWISE),
+        MotorAction("elbow_flex", Direction.ANTI_CLOCKWISE),
+    ),
+}
+
+POST_CALIBRATION_ACTIONS = {
+    "shoulder_lift": (MotorAction("shoulder_lift", Direction.ANTI_CLOCKWISE),),
+    "elbow_flex": (MotorAction("elbow_flex", Direction.CLOCKWISE),),
+    "wrist_flex": (MotorAction("wrist_flex", Direction.CLOCKWISE),),
+}
+
+
+@dataclass
+class AutoCalibrateConfig:
+    """Auto calibration configuration."""
+
+    robot: RobotConfig
+    try_torque: int = 400
+    max_torque: int = 600
+    wrist_roll_torque_limit: int = 300
+    gripper_torque_limit: int = 300
+    shoulder_pan_midpoint_adjustment: int = -150
+    torque_step: int = 50
+    explore_velocity: int = 600
+    wait_time_s: float = 0.3
+    velocity_threshold: int = 4
+    position_tolerance: int = 4000
+
+    OVER_LOAD_BIT = 0x20
+
+
+def set_calibration_paused(paused: bool):
+    """Pause or resume the current calibration workflow."""
+
+    if paused:
+        _CALIBRATION_PAUSED.set()
+    else:
+        _CALIBRATION_PAUSED.clear()
+
+
+def is_calibration_paused() -> bool:
+    """Return whether calibration is currently paused."""
+
+    return _CALIBRATION_PAUSED.is_set()
+
+
+def wait_if_calibration_paused(
+    bus: FeetechMotorsBus | None = None,
+    motor_name: str | None = None,
+    resume_velocity: int | None = None,
+):
+    """Block while calibration is paused and safely stop motor motion if needed."""
+
+    if not is_calibration_paused():
+        return
+
+    if bus is not None and motor_name is not None and resume_velocity is not None:
+        bus.write("Goal_Velocity", motor_name, 0, normalize=False)
+
+    logger.info("Calibration paused.")
+    while is_calibration_paused():
+        time.sleep(0.1)
+    logger.info("Calibration resumed.")
+
+    if bus is not None and motor_name is not None and resume_velocity is not None:
+        bus.write("Goal_Velocity", motor_name, resume_velocity, normalize=False)
+
+
+def sleep_with_pause(
+    duration_s: float,
+    bus: FeetechMotorsBus | None = None,
+    motor_name: str | None = None,
+    resume_velocity: int | None = None,
+):
+    """Sleep in small intervals so calibration can be paused responsively."""
+
+    remaining = max(duration_s, 0.0)
+    while remaining > 0:
+        wait_if_calibration_paused(bus, motor_name, resume_velocity)
+        chunk = min(0.05, remaining)
+        time.sleep(chunk)
+        remaining -= chunk
+
+
+def normalize_homing_offset(offset: int, bits: int = 11) -> int:
+    """Fold homing offset into the signed range accepted by Feetech."""
+
+    max_offset = (1 << bits) - 1
+    period = 1 << (bits + 1)
+
+    while offset > max_offset:
+        offset -= period
+    while offset < -max_offset:
+        offset += period
+
+    return offset
+
+
+def fold_unwrapped_range_to_single_turn(
+    range_min: int,
+    range_max: int,
+    offset: int,
+    max_position: int,
+) -> tuple[int, int, int]:
+    """Shift an unwrapped range back into a single-turn window."""
+
+    resolution = max_position + 1
+
+    while range_min < 0:
+        range_min += resolution
+        range_max += resolution
+        offset -= resolution
+
+    while range_max > max_position:
+        range_min -= resolution
+        range_max -= resolution
+        offset += resolution
+
+    return range_min, range_max, offset
+
+
+def unwrap_physical_limit_range(
+    first_limit: int,
+    second_limit: int,
+    second_direction: Direction,
+    resolution: int,
+) -> tuple[int, int]:
+    """Represent the two physical limits as one increasing unwrapped range."""
+
+    if second_direction == Direction.CLOCKWISE:
+        return first_limit, first_limit + ((second_limit - first_limit + resolution) % resolution)
+
+    return second_limit, second_limit + ((first_limit - second_limit + resolution) % resolution)
+
+
+def compute_directional_offset(
+    previous_position: int,
+    current_position: int,
+    direction: Direction,
+    resolution: int,
+) -> int:
+    """Compute the wrapped offset traveled in the requested direction."""
+
+    if direction == Direction.CLOCKWISE:
+        return (current_position - previous_position + resolution) % resolution
+    return (previous_position - current_position + resolution) % resolution
+
+
+def get_joint_behavior(motor_name: str) -> JointCalibrationBehavior:
+    """Collect the special-case behavior for a motor without changing its rules."""
+
+    is_shoulder_lift = "shoulder_lift" in motor_name
+    is_shoulder_pan = "shoulder_pan" in motor_name
+    is_wrist_roll = "wrist_roll" in motor_name
+    is_gripper = "gripper" in motor_name.lower()
+
+    behavior = JointCalibrationBehavior()
+    if is_shoulder_lift:
+        behavior = JointCalibrationBehavior(
+            first_direction=Direction.ANTI_CLOCKWISE,
+            second_direction=Direction.CLOCKWISE,
+            midpoint_velocity_sign=-1,
+            stop_midpoint_motion_immediately=True,
+        )
+
+    if is_wrist_roll:
+        behavior = JointCalibrationBehavior(
+            first_direction=behavior.first_direction,
+            second_direction=behavior.second_direction,
+            midpoint_velocity_sign=behavior.midpoint_velocity_sign,
+            midpoint_half_offset_adjustment=behavior.midpoint_half_offset_adjustment,
+            use_closed_position_as_center=behavior.use_closed_position_as_center,
+            stop_midpoint_motion_immediately=True,
+        )
+
+    if is_shoulder_pan:
+        behavior = JointCalibrationBehavior(
+            first_direction=behavior.first_direction,
+            second_direction=behavior.second_direction,
+            midpoint_velocity_sign=behavior.midpoint_velocity_sign,
+            midpoint_half_offset_adjustment=behavior.midpoint_half_offset_adjustment,
+            use_closed_position_as_center=behavior.use_closed_position_as_center,
+            stop_midpoint_motion_immediately=behavior.stop_midpoint_motion_immediately,
+        )
+
+    if is_gripper:
+        behavior = JointCalibrationBehavior(
+            first_direction=behavior.first_direction,
+            second_direction=behavior.second_direction,
+            midpoint_velocity_sign=behavior.midpoint_velocity_sign,
+            midpoint_half_offset_adjustment=behavior.midpoint_half_offset_adjustment,
+            use_closed_position_as_center=True,
+            stop_midpoint_motion_immediately=behavior.stop_midpoint_motion_immediately,
+        )
+
+    return behavior
+
+
+def order_motors_for_calibration(
+    motor_names: list[str],
+    preferred_order: tuple[str, ...] = DEFAULT_CALIBRATION_ORDER,
+) -> list[str]:
+    """Preserve the current calibration order through an explicit rule list."""
+
+    ordered: list[str] = []
+    for joint_name in preferred_order:
+        ordered.extend(name for name in motor_names if joint_name in name and name not in ordered)
+
+    ordered.extend(name for name in motor_names if name not in ordered)
+    return ordered
+
+
+def build_robot_calibration_plan(
+    robot: CalibratableDevice,
+    motor_names: list[str],
+) -> RobotCalibrationPlan:
+    """Build the current robot-level calibration plan from explicit rules."""
+
+    motors_to_calibrate = list(motor_names)
+    if getattr(robot, "name", None) == "xlehead":
+        motors_to_calibrate = [motor for motor in motors_to_calibrate if motor.startswith("head")]
+
+    return RobotCalibrationPlan(
+        ordered_motors=tuple(order_motors_for_calibration(motors_to_calibrate)),
+        recovery_order=tuple(motors_to_calibrate),
+        pre_actions=PRE_CALIBRATION_ACTIONS,
+        post_actions=POST_CALIBRATION_ACTIONS,
+    )
+
+
+def run_motor_actions(
+    bus: FeetechMotorsBus,
+    actions: tuple[MotorAction, ...],
+    config: AutoCalibrateConfig,
+):
+    """Run a fixed sequence of exploration actions."""
+
+    for action in actions:
+        explore_literal_limit(bus, action.motor_name, action.direction, config)
+
+
+def run_matching_actions(
+    bus: FeetechMotorsBus,
+    motor_name: str,
+    action_map: dict[str, tuple[MotorAction, ...]],
+    config: AutoCalibrateConfig,
+):
+    """Run every action whose trigger matches the current motor name."""
+
+    for trigger, actions in action_map.items():
+        if trigger in motor_name:
+            run_motor_actions(bus, actions, config)
+
+
+def stop_motor_motion(bus: FeetechMotorsBus, motor_name: str):
+    """Best-effort stop used around calibration phase boundaries."""
 
     try:
-        parameters = inspect.signature(calibration_func).parameters
-    except (TypeError, ValueError):
-        parameters = {"calibration_path": None}
-
-    if "calibration_path" in parameters:
-        result = calibration_func(device, config, calibration_path=output_path)
-    elif "save" in parameters:
-        result = calibration_func(device, config, save=False)
-    else:
-        result = calibration_func(device, config)
-
-    saved_path = getattr(result, "calibration_path", None)
-    calibration_dict = getattr(result, "calibration_dict", None)
-    if calibration_dict is None and isinstance(result, dict):
-        calibration_dict = result
-
-    if saved_path is not None and Path(saved_path) == output_path:
-        return output_path
-
-    if calibration_dict is not None and save_calibration_to_file is not None:
-        save_calibration_to_file(calibration_dict, output_path)
-        return output_path
-
-    if saved_path is not None:
-        return Path(saved_path)
-
-    return output_path
+        bus.write("Goal_Velocity", motor_name, 0, normalize=False)
+        if "wrist_roll" in motor_name:
+            bus.write("Torque_Enable", motor_name, 0, normalize=False)
+    except Exception:
+        logger.exception("Failed to stop motor velocity for %s", motor_name)
 
 
-class WorkerBase(QObject):
-    finished = Signal()
-    succeeded = Signal(str)
-    failed = Signal(str)
-    status_changed = Signal(str, str)
+def get_motor_torque_limit(motor_name: str, config: AutoCalibrateConfig) -> int:
+    if "wrist_roll" in motor_name:
+        return config.wrist_roll_torque_limit
+    if "gripper" in motor_name:
+        return config.gripper_torque_limit
+    return config.try_torque
 
 
-class CalibrationWorker(WorkerBase):
-    def __init__(self, device_type: str, port: str, filename: str):
-        super().__init__()
-        self.device_type = device_type
-        self.port = port
-        self.filename = filename
+def get_motor_max_torque_limit(motor_name: str, config: AutoCalibrateConfig) -> int:
+    if "wrist_roll" in motor_name:
+        return config.wrist_roll_torque_limit
+    if "gripper" in motor_name:
+        return config.gripper_torque_limit
+    return config.max_torque
 
-    def run(self):
-        device = None
+
+def explore_literal_limit(
+    bus: FeetechMotorsBus,
+    motor_name: str,
+    direction: Direction,
+    config: AutoCalibrateConfig,
+) -> tuple[int, int]:
+    """Explore a single mechanical limit and return traveled offset and stop position."""
+
+    logger.info(f"Exploring {motor_name} {direction.value} limit...")
+
+    resolution = SERVO_RESOLUTION
+    current_torque = get_motor_torque_limit(motor_name, config)
+    motor_max_torque = get_motor_max_torque_limit(motor_name, config)
+    previous_position = bus.read("Present_Position", motor_name, normalize=False)
+    start_position = previous_position
+    limit_position = previous_position
+    still_count = 0
+
+    goal_velocity = config.explore_velocity if direction == Direction.CLOCKWISE else -config.explore_velocity
+
+    bus.write("Operating_Mode", motor_name, OperatingMode.VELOCITY.value, normalize=False)
+    bus.write("Torque_Limit", motor_name, current_torque, normalize=False)
+    bus.write("Torque_Enable", motor_name, 1, normalize=False)
+    bus.write("Goal_Velocity", motor_name, goal_velocity, normalize=False)
+
+    while True:
+        sleep_with_pause(config.wait_time_s, bus, motor_name, goal_velocity)
+
         try:
-            self.status_changed.emit(STATUS_CALIBRATING, f"正在连接 {self.port} 并开始标定。")
-            config_kwargs = {
-                "port": self.port,
-                "id": Path(self.filename).stem or "my_so101",
-            }
-            device_config = DEVICE_CONFIG_FACTORIES[self.device_type](**config_kwargs)
-            auto_calib_config = AutoCalibrateConfig(
-                robot=device_config,
-                **AUTO_CALIBRATION_DEFAULTS[self.device_type],
+            current_position = bus.read("Present_Position", motor_name, normalize=False)
+        except RuntimeError as error:
+            if "Overload error" in str(error):
+                logger.info("Motor overloaded, releasing torque before reading current position again.")
+                while True:
+                    try:
+                        bus.write("Torque_Limit", motor_name, 0, normalize=False)
+                        sleep_with_pause(0.2, bus, motor_name, 0)
+                    except RuntimeError:
+                        continue
+                    break
+
+                current_position = bus.read("Present_Position", motor_name, normalize=False)
+                compute_directional_offset(previous_position, current_position, direction, resolution)
+                limit_position = current_position
+                break
+            raise
+
+        compute_directional_offset(previous_position, current_position, direction, resolution)
+        limit_position = current_position
+
+        current_velocity = bus.read("Present_Velocity", motor_name, normalize=False)
+        if abs(current_velocity) <= config.velocity_threshold and current_position == previous_position:
+            still_count += 1
+            logger.info(
+                "Motor appears stationary: "
+                f"pos={current_position}, velocity={current_velocity}, still_count={still_count}"
             )
 
-            device = DEVICE_FACTORIES[self.device_type](device_config)
-            device.connect(calibrate=False)
-
-            output_path = Path(device.calibration_fpath).with_name(self.ensure_json_suffix(self.filename))
-            final_path = run_auto_calibration_for_ui(device, auto_calib_config, output_path)
-            self.status_changed.emit(STATUS_FINISHED, f"标定完成，文件已保存到：{final_path}")
-            self.succeeded.emit(str(final_path))
-        except Exception as error:
-            logger.exception("Auto calibration failed.")
-            self.status_changed.emit(STATUS_FAILED, str(error))
-            self.failed.emit(str(error))
-        finally:
-            if device is not None:
-                try:
-                    device.disconnect()
-                except Exception:
-                    logger.exception("Failed to disconnect calibration device cleanly.")
-            self.finished.emit()
-
-    @staticmethod
-    def ensure_json_suffix(filename: str) -> str:
-        cleaned = filename.strip() or "my_so101"
-        return cleaned if cleaned.lower().endswith(".json") else f"{cleaned}.json"
-
-
-class LinuxPermissionWorker(WorkerBase):
-    def __init__(self, password: str):
-        super().__init__()
-        self.password = password
-
-    def run(self):
-        try:
-            self.status_changed.emit(STATUS_AUTHORIZING, "正在给 /dev/ttyACM* 设置读写权限。")
-            matched_ports = sorted(glob.glob(f"{LINUX_PORT_PREFIX}*"))
-            if not matched_ports:
-                raise RuntimeError("未找到 /dev/ttyACM* 设备，请先连接机械臂。")
-
-            result = subprocess.run(
-                ["sudo", "-S", "/bin/sh", "-c", "chmod 666 /dev/ttyACM*"],
-                input=f"{self.password}\n",
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-            if result.returncode != 0:
-                error = (result.stderr or result.stdout).strip()
-                raise RuntimeError(error or "端口授权失败，请确认密码是否正确。")
-
-            inaccessible = [port for port in matched_ports if not os.access(port, os.R_OK | os.W_OK)]
-            if inaccessible:
-                raise RuntimeError(f"以下端口仍不可读写：{', '.join(inaccessible)}")
-
-            message = f"端口授权成功：{', '.join(matched_ports)}"
-            self.status_changed.emit(STATUS_PORT_DETECTED, message)
-            self.succeeded.emit(message)
-        except Exception as error:
-            logger.exception("Failed to grant Linux port permissions.")
-            self.status_changed.emit(STATUS_FAILED, str(error))
-            self.failed.emit(str(error))
-        finally:
-            self.finished.emit()
-
-
-class ArmCheckWorker(WorkerBase):
-    def __init__(self, device_type: str, port: str):
-        super().__init__()
-        self.device_type = device_type
-        self.port = port
-
-    def run(self):
-        device = None
-        try:
-            self.status_changed.emit(STATUS_CHECKING_ARM, f"正在检测机械臂，端口：{self.port}")
-            device_config = DEVICE_CONFIG_FACTORIES[self.device_type](port=self.port, id="arm_check")
-            device = DEVICE_FACTORIES[self.device_type](device_config)
-            device.connect(calibrate=False)
-
-            bus = getattr(device, "bus", None)
-            if bus is None:
-                raise RuntimeError("当前设备未暴露 bus，无法执行机械臂检测。")
-
-            motor_name = self.find_gripper_motor_name(bus)
-            self.move_motor_to_limits(bus, motor_name)
-
-            message = f"{motor_name} 已完成双向边界检测。"
-            self.status_changed.emit(STATUS_PORT_DETECTED, message)
-            self.succeeded.emit(message)
-        except Exception as error:
-            logger.exception("Arm check failed.")
-            self.status_changed.emit(STATUS_FAILED, str(error))
-            self.failed.emit(str(error))
-        finally:
-            if device is not None:
-                try:
-                    device.disconnect()
-                except Exception:
-                    logger.exception("Failed to disconnect after arm check.")
-            self.finished.emit()
-
-    @staticmethod
-    def find_gripper_motor_name(bus) -> str:
-        if "gripper" in bus.motors:
-            return "gripper"
-        for motor_name, motor in bus.motors.items():
-            if getattr(motor, "id", None) == 6:
-                return motor_name
-        raise RuntimeError("未找到 6 号舵机或 gripper 电机。")
-
-    @staticmethod
-    def move_motor_to_limits(bus, motor_name: str):
-        original_mode = bus.read("Operating_Mode", motor_name, normalize=False)
-        original_torque_limit = bus.read("Torque_Limit", motor_name, normalize=False)
-        original_torque_enable = bus.read("Torque_Enable", motor_name, normalize=False)
-
-        behavior = get_joint_behavior(motor_name)
-        check_config = AutoCalibrateConfig(
-            robot=None,
-            try_torque=GRIPPER_CHECK_TORQUE,
-            max_torque=GRIPPER_CHECK_TORQUE,
-            torque_step=50,
-            explore_velocity=GRIPPER_CHECK_VELOCITY,
-            wait_time_s=0.2,
-            velocity_threshold=4,
-            position_tolerance=4000,
-        )
-
-        try:
-            bus.write("Operating_Mode", motor_name, OperatingMode.VELOCITY.value, normalize=False)
-            bus.write("Torque_Limit", motor_name, GRIPPER_CHECK_TORQUE, normalize=False)
-            bus.write("Torque_Enable", motor_name, 1, normalize=False)
-
-            logger.info("Arm check: exploring first limit for %s", motor_name)
-            explore_literal_limit(bus, motor_name, behavior.first_direction, check_config)
-            time.sleep(check_config.wait_time_s)
-            logger.info("Arm check: exploring reverse limit for %s", motor_name)
-            explore_literal_limit(bus, motor_name, behavior.second_direction, check_config)
-        finally:
-            try:
-                bus.write("Goal_Velocity", motor_name, 0, normalize=False)
-            finally:
-                bus.write("Operating_Mode", motor_name, original_mode, normalize=False)
-                bus.write("Torque_Limit", motor_name, original_torque_limit, normalize=False)
-                bus.write("Torque_Enable", motor_name, original_torque_enable, normalize=False)
-
-
-class AutoCalibrateWindow(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.worker_thread: QThread | None = None
-        self.worker: WorkerBase | None = None
-        self.current_status = STATUS_IDLE
-        self.last_output_path = ""
-        self._log_handler: QtLogHandler | None = None
-
-        self.setWindowTitle("SO 自动标定")
-        self.resize(1040, 760)
-        self.setMinimumSize(920, 680)
-
-        self._setup_logging()
-        self._build_ui()
-        self._apply_styles()
-        self._setup_port_timer()
-        self.refresh_ports()
-
-    def _setup_logging(self):
-        root_logger = logging.getLogger()
-        root_logger.setLevel(logging.INFO)
-        self._log_handler = QtLogHandler()
-        self._log_handler.setFormatter(
-            logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s", "%H:%M:%S")
-        )
-        self._log_handler.emitter.message_emitted.connect(self.append_log)
-        root_logger.addHandler(self._log_handler)
-
-    def _build_ui(self):
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-
-        main_layout = QVBoxLayout(central_widget)
-        main_layout.setContentsMargins(28, 24, 28, 24)
-        main_layout.setSpacing(18)
-
-        header_layout = QVBoxLayout()
-        title_label = QLabel("自动标定控制台")
-        title_label.setObjectName("titleLabel")
-        subtitle_label = QLabel(
-            f"基于 {QT_LIB} 的标定页面，支持串口检测、Linux 端口授权、机械臂检测和自动标定。"
-        )
-        subtitle_label.setObjectName("subtitleLabel")
-        header_layout.addWidget(title_label)
-        header_layout.addWidget(subtitle_label)
-        main_layout.addLayout(header_layout)
-
-        top_layout = QHBoxLayout()
-        top_layout.setSpacing(18)
-        main_layout.addLayout(top_layout)
-
-        config_group = QGroupBox("标定配置")
-        config_layout = QGridLayout(config_group)
-        config_layout.setHorizontalSpacing(14)
-        config_layout.setVerticalSpacing(14)
-
-        self.device_type_combo = QComboBox()
-        self.device_type_combo.addItem("tele", "tele")
-        self.device_type_combo.addItem("robot", "robot")
-        self.device_type_combo.currentIndexChanged.connect(self.on_device_type_changed)
-
-        self.port_combo = QComboBox()
-        self.port_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.port_combo.currentIndexChanged.connect(self.on_port_changed)
-
-        self.refresh_button = QPushButton("刷新串口")
-        self.refresh_button.setObjectName("secondaryButton")
-        self.refresh_button.clicked.connect(self.refresh_ports)
-
-        self.filename_input = QLineEdit("my_so101")
-        self.filename_input.setPlaceholderText("例如：tele_calibration 或 robot_01.json")
-        self.filename_input.textChanged.connect(self.on_filename_changed)
-
-        filename_hint = QLabel("只修改文件名，不修改保存目录。最终仍保存到设备默认 calibration 路径。")
-        filename_hint.setObjectName("hintLabel")
-
-        config_layout.addWidget(QLabel("设备类型"), 0, 0)
-        config_layout.addWidget(self.device_type_combo, 0, 1, 1, 2)
-        config_layout.addWidget(QLabel("串口"), 1, 0)
-        config_layout.addWidget(self.port_combo, 1, 1)
-        config_layout.addWidget(self.refresh_button, 1, 2)
-        config_layout.addWidget(QLabel("输出文件名"), 2, 0)
-        config_layout.addWidget(self.filename_input, 2, 1, 1, 2)
-        config_layout.addWidget(filename_hint, 3, 0, 1, 3)
-
-        status_group = QGroupBox("运行状态")
-        status_layout = QVBoxLayout(status_group)
-        status_layout.setSpacing(12)
-
-        self.status_badge = QLabel(STATUS_IDLE)
-        self.status_badge.setObjectName("statusBadge")
-
-        self.status_detail_label = QLabel("等待检测串口。")
-        self.status_detail_label.setWordWrap(True)
-        self.status_detail_label.setObjectName("statusDetailLabel")
-
-        info_card = QFrame()
-        info_card.setObjectName("infoCard")
-        info_layout = QVBoxLayout(info_card)
-        info_layout.setContentsMargins(16, 16, 16, 16)
-        info_layout.setSpacing(10)
-        info_layout.addWidget(self.status_badge)
-        info_layout.addWidget(self.status_detail_label)
-
-        self.output_hint_label = QLabel("输出路径：未生成")
-        self.output_hint_label.setWordWrap(True)
-        self.output_hint_label.setObjectName("outputHintLabel")
-
-        status_layout.addWidget(info_card)
-        status_layout.addWidget(self.output_hint_label)
-        status_layout.addStretch(1)
-
-        top_layout.addWidget(config_group, 3)
-        top_layout.addWidget(status_group, 2)
-
-        button_layout = QHBoxLayout()
-        button_layout.setSpacing(12)
-        main_layout.addLayout(button_layout)
-
-        self.start_button = QPushButton("开始标定")
-        self.start_button.setObjectName("primaryButton")
-        self.start_button.clicked.connect(self.start_calibration)
-
-        self.pause_button = QPushButton("暂停标定")
-        self.pause_button.setObjectName("pauseButton")
-        self.pause_button.clicked.connect(self.toggle_pause_calibration)
-
-        self.recalibrate_button = QPushButton("重新标定")
-        self.recalibrate_button.setObjectName("secondaryButton")
-        self.recalibrate_button.clicked.connect(self.restart_calibration)
-
-        self.arm_check_button = QPushButton("检测机械臂")
-        self.arm_check_button.setObjectName("secondaryButton")
-        self.arm_check_button.clicked.connect(self.start_arm_check)
-
-        self.permission_button = QPushButton("Linux 端口授权")
-        self.permission_button.setObjectName("secondaryButton")
-        self.permission_button.clicked.connect(self.grant_linux_permissions)
-        self.permission_button.setVisible(IS_LINUX)
-
-        button_layout.addWidget(self.start_button)
-        button_layout.addWidget(self.pause_button)
-        button_layout.addWidget(self.recalibrate_button)
-        button_layout.addWidget(self.arm_check_button)
-        if IS_LINUX:
-            button_layout.addWidget(self.permission_button)
-        button_layout.addStretch(1)
-
-        log_group = QGroupBox("日志输出")
-        log_layout = QVBoxLayout(log_group)
-        self.log_output = QPlainTextEdit()
-        self.log_output.setReadOnly(True)
-        self.log_output.setMaximumBlockCount(4000)
-        self.log_output.setObjectName("logOutput")
-        self.log_output.setFont(QFont("Consolas", 10))
-        log_layout.addWidget(self.log_output)
-        main_layout.addWidget(log_group, 1)
-
-        self.append_log(f"UI 已启动，正在检测本机可用串口。当前图形库：{QT_LIB}")
-        self.update_action_buttons()
-        self.update_output_preview()
-
-    def _apply_styles(self):
-        self.setStyleSheet(
-            """
-            QMainWindow, QWidget {
-                background: #f4f1ea;
-                color: #1f2933;
-                font-family: "Microsoft YaHei UI", "Segoe UI", sans-serif;
-                font-size: 14px;
-            }
-            QGroupBox {
-                border: 1px solid #d5ccc1;
-                border-radius: 16px;
-                margin-top: 12px;
-                padding-top: 16px;
-                background: #fbfaf7;
-                font-weight: 600;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 14px;
-                padding: 0 6px;
-                color: #6f4e37;
-            }
-            QLabel#titleLabel {
-                font-size: 28px;
-                font-weight: 700;
-                color: #173f35;
-            }
-            QLabel#subtitleLabel {
-                color: #5b6b73;
-                font-size: 13px;
-            }
-            QLabel#hintLabel, QLabel#outputHintLabel, QLabel#statusDetailLabel {
-                color: #5f6b66;
-            }
-            QLineEdit, QComboBox, QPushButton {
-                min-height: 40px;
-                border-radius: 10px;
-                border: 1px solid #cfc4b7;
-                padding: 0 12px;
-                background: #ffffff;
-            }
-            QLineEdit:focus, QComboBox:focus {
-                border: 1px solid #1f8a70;
-            }
-            QPushButton {
-                background: #fffaf4;
-                font-weight: 600;
-                color: #344054;
-            }
-            QPushButton:hover {
-                border: 1px solid #1f8a70;
-                background: #f5efe6;
-            }
-            QPushButton:disabled {
-                background: #ddd6cb;
-                color: #8a847a;
-                border: 1px solid #c7beb3;
-            }
-            QPushButton#primaryButton {
-                background: #1f8a70;
-                color: white;
-                border: 1px solid #1f8a70;
-            }
-            QPushButton#primaryButton:hover {
-                background: #19715c;
-            }
-            QPushButton#primaryButton:disabled {
-                background: #9fcabc;
-                color: #eef7f3;
-                border: 1px solid #9fcabc;
-            }
-            QPushButton#pauseButton {
-                background: #fff3e8;
-                color: #9a3412;
-                border: 1px solid #fdba74;
-            }
-            QPushButton#pauseButton:hover {
-                background: #ffedd5;
-                border: 1px solid #fb923c;
-            }
-            QPushButton#pauseButton:disabled {
-                background: #f1e3d5;
-                color: #b9a18d;
-                border: 1px solid #e3d1bf;
-            }
-            QPushButton#secondaryButton {
-                background: #f8f5ef;
-                color: #475467;
-                border: 1px solid #d7cec2;
-            }
-            QPushButton#secondaryButton:hover {
-                background: #f1ece4;
-                border: 1px solid #b9ab98;
-            }
-            QPushButton#secondaryButton:disabled {
-                background: #e7e1d8;
-                color: #9b948a;
-                border: 1px solid #d1c8bc;
-            }
-            QFrame#infoCard {
-                background: qlineargradient(
-                    x1: 0, y1: 0, x2: 1, y2: 1,
-                    stop: 0 #f7efe6, stop: 1 #eef6f2
-                );
-                border-radius: 18px;
-                border: 1px solid #dfd6ca;
-            }
-            QLabel#statusBadge {
-                font-size: 22px;
-                font-weight: 700;
-                color: #173f35;
-            }
-            QPlainTextEdit#logOutput {
-                background: #18232d;
-                color: #d8efe6;
-                border-radius: 14px;
-                border: 1px solid #25333f;
-                padding: 12px;
-                selection-background-color: #2e6f62;
-            }
-            """
-        )
-
-    def _setup_port_timer(self):
-        self.port_timer = QTimer(self)
-        self.port_timer.setInterval(1500)
-        self.port_timer.timeout.connect(self.refresh_ports)
-        self.port_timer.start()
-
-    def closeEvent(self, event):
-        if self._log_handler is not None:
-            logging.getLogger().removeHandler(self._log_handler)
-        super().closeEvent(event)
-
-    def append_log(self, message: str):
-        self.log_output.appendPlainText(message)
-        cursor = self.log_output.textCursor()
-        cursor.movePosition(QTextCursor.End)
-        self.log_output.setTextCursor(cursor)
-
-    def set_status(self, status: str, detail: str):
-        self.current_status = status
-        self.status_badge.setText(status)
-        self.status_detail_label.setText(detail)
-        self.update_status_badge_color(status)
-        self.update_action_buttons()
-
-    def update_status_badge_color(self, status: str):
-        color_map = {
-            STATUS_IDLE: "#6b7280",
-            STATUS_PORT_DETECTED: "#1d7a5f",
-            STATUS_CALIBRATING: "#a05a00",
-            STATUS_PAUSED: "#b45309",
-            STATUS_FINISHED: "#0f766e",
-            STATUS_FAILED: "#b42318",
-            STATUS_AUTHORIZING: "#7c3aed",
-            STATUS_CHECKING_ARM: "#2563eb",
-        }
-        self.status_badge.setStyleSheet(f"color: {QColor(color_map.get(status, '#173f35')).name()};")
-
-    def on_device_type_changed(self):
-        suggested_name = "tele_calibration" if self.selected_device_type() == "tele" else "robot_calibration"
-        if not self.filename_input.text().strip() or self.filename_input.text() in {
-            "my_so101",
-            "tele_calibration",
-            "robot_calibration",
-        }:
-            self.filename_input.setText(suggested_name)
-        self.update_output_preview()
-        self.update_action_buttons()
-
-    def on_port_changed(self):
-        self.update_output_preview()
-        self.update_action_buttons()
-
-    def on_filename_changed(self):
-        self.update_output_preview()
-        self.update_action_buttons()
-
-    def list_available_ports(self) -> list[SerialPortInfo]:
-        ports: list[SerialPortInfo] = []
-        for port in list_ports.comports():
-            device_name = str(port.device)
-            if IS_WINDOWS and not device_name.upper().startswith("COM"):
-                continue
-            if IS_LINUX and LINUX_PORT_PREFIX not in device_name:
-                continue
-            ports.append(SerialPortInfo(device=device_name, description=port.description or "Unknown device"))
-        ports.sort(key=lambda item: item.device)
-        return ports
-
-    def refresh_ports(self):
-        if self.current_status in BUSY_STATUSES:
-            return
-
-        current_port = self.selected_port()
-        ports = self.list_available_ports()
-
-        self.port_combo.blockSignals(True)
-        self.port_combo.clear()
-        for port in ports:
-            self.port_combo.addItem(port.label, port.device)
-
-        if ports:
-            target_index = 0
-            if current_port:
-                for index, port in enumerate(ports):
-                    if port.device == current_port:
-                        target_index = index
-                        break
-            self.port_combo.setCurrentIndex(target_index)
-        self.port_combo.blockSignals(False)
-
-        if self.current_status not in TERMINAL_STATUSES:
-            if ports:
-                self.set_status(STATUS_PORT_DETECTED, f"当前检测到 {len(ports)} 个可用串口。")
-            else:
-                if IS_LINUX:
-                    self.set_status(STATUS_IDLE, "未检测到 /dev/ttyACM* 串口，请连接设备后重试。")
-                else:
-                    self.set_status(STATUS_IDLE, "未检测到可用串口，请连接设备后重试。")
-
-        self.update_output_preview()
-        self.update_action_buttons()
-
-    def selected_device_type(self) -> str:
-        return self.device_type_combo.currentData() or "tele"
-
-    def selected_port(self) -> str:
-        return self.port_combo.currentData() or ""
-
-    def normalized_filename(self) -> str:
-        text = self.filename_input.text().strip()
-        if not text:
-            return ""
-        return text if text.lower().endswith(".json") else f"{text}.json"
-
-    def resolve_output_path_preview(self) -> Path | None:
-        filename = self.normalized_filename()
-        port = self.selected_port()
-        if not filename or not port:
-            return None
-
-        try:
-            device_type = self.selected_device_type()
-            device_config = DEVICE_CONFIG_FACTORIES[device_type](port=port, id=Path(filename).stem or "my_so101")
-            device = DEVICE_FACTORIES[device_type](device_config)
-            return Path(device.calibration_fpath).with_name(filename)
-        except Exception:
-            return None
-
-    def update_output_preview(self):
-        filename = self.normalized_filename()
-        if not filename:
-            self.output_hint_label.setText("输出路径：请先输入文件名")
-            return
-
-        if self.last_output_path:
-            preview_path = Path(self.last_output_path).with_name(filename)
-            self.output_hint_label.setText(f"输出路径：{preview_path}")
-            return
-
-        preview_path = self.resolve_output_path_preview()
-        if preview_path is not None:
-            self.output_hint_label.setText(f"输出路径：{preview_path}")
-            return
-
-        self.output_hint_label.setText(f"输出路径：{filename} | 连接设备后可显示完整保存位置")
-
-    def can_start_calibration(self) -> bool:
-        return bool(self.selected_port() and self.filename_input.text().strip())
-
-    def has_running_calibration(self) -> bool:
-        return isinstance(self.worker, CalibrationWorker)
-
-    def start_worker(self, worker: WorkerBase):
-        self.worker_thread = QThread(self)
-        self.worker = worker
-        self.worker.moveToThread(self.worker_thread)
-
-        self.worker_thread.started.connect(self.worker.run)
-        self.worker.status_changed.connect(self.set_status)
-        self.worker.succeeded.connect(self.on_worker_success)
-        self.worker.failed.connect(self.on_worker_failed)
-        self.worker.finished.connect(self.worker_thread.quit)
-        self.worker.finished.connect(self.worker.deleteLater)
-        self.worker_thread.finished.connect(self.worker_thread.deleteLater)
-        self.worker_thread.finished.connect(self.on_worker_finished)
-        self.worker_thread.start()
-        self.update_action_buttons()
-
-    def update_action_buttons(self):
-        ready = self.can_start_calibration()
-        is_busy = self.current_status in BUSY_STATUSES
-        has_running_calibration = self.has_running_calibration()
-
-        self.start_button.setEnabled(ready and not is_busy and self.current_status in ACTIVE_STATUSES)
-        self.pause_button.setEnabled(has_running_calibration and self.current_status in {STATUS_CALIBRATING, STATUS_PAUSED})
-        self.pause_button.setText("继续标定" if is_calibration_paused() else "暂停标定")
-        self.recalibrate_button.setEnabled(ready and not is_busy and self.current_status in TERMINAL_STATUSES)
-        self.arm_check_button.setEnabled(bool(self.selected_port()) and not is_busy)
-        self.refresh_button.setEnabled(not is_busy)
-        self.device_type_combo.setEnabled(not is_busy)
-        self.port_combo.setEnabled(not is_busy)
-        self.filename_input.setEnabled(not is_busy)
-        if IS_LINUX:
-            self.permission_button.setEnabled(not is_busy)
-
-    def start_calibration(self):
-        if not self.can_start_calibration():
-            QMessageBox.warning(self, "输入不完整", "请选择设备类型、串口，并填写输出文件名。")
-            return
-
-        selected_port = self.selected_port()
-        selected_type = self.selected_device_type()
-        filename = self.filename_input.text().strip()
-
-        set_calibration_paused(False)
-        self.append_log("")
-        self.append_log("=" * 72)
-        self.append_log(
-            f"准备开始标定 | device_type={selected_type} | port={selected_port} | file={filename}"
-        )
-        self.start_worker(CalibrationWorker(selected_type, selected_port, filename))
-
-    def toggle_pause_calibration(self):
-        if not self.has_running_calibration():
-            return
-
-        if is_calibration_paused():
-            set_calibration_paused(False)
-            self.append_log("继续标定。")
-            self.set_status(STATUS_CALIBRATING, "标定已继续执行。")
+            if still_count >= 1:
+                logger.info(f"Velocity near zero and position stable. Limit found at {current_position}.")
+                break
+
+            if current_torque < motor_max_torque:
+                current_torque = min(current_torque + config.torque_step, motor_max_torque)
+                bus.write("Torque_Limit", motor_name, current_torque, normalize=False)
         else:
-            set_calibration_paused(True)
-            self.append_log("暂停标定，当前舵机保持锁住状态。")
-            self.set_status(STATUS_PAUSED, "标定已暂停，当前动作会安全停下，舵机保持锁住，等待继续。")
+            still_count = 0
 
-    def restart_calibration(self):
-        self.append_log("收到重新标定请求，准备重新开始。")
-        self.start_calibration()
+        status = bus.read("Status", motor_name, normalize=False)
+        if status & config.OVER_LOAD_BIT != 0:
+            logger.info("Motor status indicates overload. Stopping exploration.")
+            break
 
-    def start_arm_check(self):
-        selected_port = self.selected_port()
-        if not selected_port:
-            QMessageBox.warning(self, "未选择串口", "请先选择串口。")
-            return
+        previous_position = current_position
 
-        self.append_log("")
-        self.append_log("=" * 72)
-        self.append_log(f"准备检测机械臂 | device_type={self.selected_device_type()} | port={selected_port}")
-        self.start_worker(ArmCheckWorker(self.selected_device_type(), selected_port))
+    total_offset = compute_directional_offset(start_position, current_position, direction, resolution)
 
-    def grant_linux_permissions(self):
-        if not IS_LINUX:
-            return
+    stop_motor_motion(bus, motor_name)
+    return total_offset, limit_position
 
-        password, ok = QInputDialog.getText(
-            self,
-            "Linux 端口授权",
-            "请输入 sudo 密码：",
-            QLineEdit.Password,
+
+def log_limit_result(step_index: int, direction: Direction, limit_position: int, traveled_offset: int):
+    """Log one limit exploration result."""
+
+    logger.info(f"\nStep {step_index}: explore {direction.value} limit...")
+    logger.info(f"{direction.value} limit position: {limit_position}")
+    logger.info(f"{direction.value} traveled offset: {traveled_offset}")
+
+
+def run_limit_exploration_sequence(
+    bus: FeetechMotorsBus,
+    motor_name: str,
+    config: AutoCalibrateConfig,
+    behavior: JointCalibrationBehavior,
+) -> LimitExplorationResult:
+    """Run the two-step limit search for one joint."""
+
+    first_offset, first_limit = explore_literal_limit(bus, motor_name, behavior.first_direction, config)
+    log_limit_result(1, behavior.first_direction, first_limit, first_offset)
+
+    second_offset, second_limit = explore_literal_limit(bus, motor_name, behavior.second_direction, config)
+    log_limit_result(2, behavior.second_direction, second_limit, second_offset)
+
+    return LimitExplorationResult(
+        first_offset=first_offset,
+        first_limit=first_limit,
+        second_offset=second_offset,
+        second_limit=second_limit,
+    )
+
+
+def move_motor_to_midpoint(
+    bus: FeetechMotorsBus,
+    motor_name: str,
+    config: AutoCalibrateConfig,
+    behavior: JointCalibrationBehavior,
+    half_offset: int,
+) -> int:
+    """Replay the current midpoint motion logic without changing stop conditions."""
+
+    current_position = bus.read("Present_Position", motor_name, normalize=False)
+    midpoint_position = (current_position + half_offset) % SERVO_RESOLUTION
+
+    logger.info(f"Step 3: half offset: {half_offset}")
+    logger.info(f"Step 3: computed midpoint: {midpoint_position}")
+    logger.info("Step 4: moving toward midpoint...")
+
+    bus.write("Operating_Mode", motor_name, OperatingMode.VELOCITY.value, normalize=False)
+    bus.write("Torque_Limit", motor_name, get_motor_torque_limit(motor_name, config), normalize=False)
+    bus.write("Torque_Enable", motor_name, 1, normalize=False)
+    bus.write(
+        "Goal_Velocity",
+        motor_name,
+        behavior.midpoint_velocity_sign * config.explore_velocity,
+        normalize=False,
+    )
+
+    previous_position = bus.read("Present_Position", motor_name, normalize=False)
+    moved_offset = 0
+    while True:
+        wait_if_calibration_paused(
+            bus,
+            motor_name,
+            behavior.midpoint_velocity_sign * config.explore_velocity,
         )
-        if not ok:
-            return
-        if not password:
-            QMessageBox.warning(self, "密码为空", "请输入 sudo 密码。")
-            return
 
-        self.append_log("")
-        self.append_log("=" * 72)
-        self.append_log("准备执行 Linux 端口授权。")
-        self.start_worker(LinuxPermissionWorker(password))
+        if behavior.stop_midpoint_motion_immediately:
+            stop_motor_motion(bus, motor_name)
+            break
 
-    def on_worker_success(self, message: str):
-        if self.current_status == STATUS_FINISHED:
-            self.last_output_path = message
-            self.update_output_preview()
-        self.append_log(message)
+        current_position = bus.read("Present_Position", motor_name, normalize=False)
+        if moved_offset >= half_offset:
+            stop_motor_motion(bus, motor_name)
+            break
 
-    def on_worker_failed(self, error_message: str):
-        log_title, dialog_title = classify_worker_failure(self.worker)
-        self.append_log(f"{log_title}：{error_message}")
-        QMessageBox.critical(self, dialog_title, error_message)
+        delta = (current_position - previous_position + SERVO_RESOLUTION) % SERVO_RESOLUTION
+        if delta > config.position_tolerance:
+            previous_position = current_position
+            continue
 
-    def on_worker_finished(self):
-        set_calibration_paused(False)
-        self.worker = None
-        self.worker_thread = None
-        self.update_action_buttons()
+        moved_offset += delta
+        previous_position = current_position
+    stop_motor_motion(bus, motor_name)
+    actual_midpoint = bus.read("Present_Position", motor_name, normalize=False)
+    logger.info(f"Actual midpoint position: logical={actual_midpoint}, physical={actual_midpoint}")
+    return actual_midpoint
+
+
+def auto_calibrate_single_joint(
+    bus: FeetechMotorsBus,
+    motor_name: str,
+    config: AutoCalibrateConfig,
+) -> MotorCalibration:
+    """Auto calibrate a single joint."""
+
+    logger.info(f"\nStarting auto calibration for motor {motor_name}")
+    logger.info("=" * 60)
+
+    motor = bus.motors[motor_name]
+    model = motor.model
+    max_position = bus.model_resolution_table[model] - 1
+    motor_try_torque = get_motor_torque_limit(motor_name, config)
+    motor_max_torque = get_motor_max_torque_limit(motor_name, config)
+
+    bus.write("Max_Torque_Limit", motor_name, motor_max_torque, normalize=False)
+    bus.write("Overload_Torque", motor_name, int(motor_try_torque * 95 / motor_max_torque), normalize=False)
+    bus.write("Min_Position_Limit", motor_name, 0, normalize=False)
+    bus.write("Max_Position_Limit", motor_name, max_position, normalize=False)
+
+    original_offset = bus.read("Homing_Offset", motor_name, normalize=False)
+    original_present = bus.read("Present_Position", motor_name, normalize=False)
+    original_physical = original_present + original_offset
+    logger.info(
+        f"Current position: logical={original_present}, physical={original_physical}, offset={original_offset}"
+    )
+
+    bus.write("Homing_Offset", motor_name, 0, normalize=False)
+    current_present = bus.read("Present_Position", motor_name, normalize=False)
+    logger.info(f"After resetting offset: logical={current_present}, physical={current_present}, offset=0")
+
+    behavior = get_joint_behavior(motor_name)
+    if "shoulder_pan" in motor_name:
+        behavior = JointCalibrationBehavior(
+            first_direction=behavior.first_direction,
+            second_direction=behavior.second_direction,
+            midpoint_velocity_sign=behavior.midpoint_velocity_sign,
+            midpoint_half_offset_adjustment=config.shoulder_pan_midpoint_adjustment,
+            use_closed_position_as_center=behavior.use_closed_position_as_center,
+            stop_midpoint_motion_immediately=behavior.stop_midpoint_motion_immediately,
+        )
+    limit_result = run_limit_exploration_sequence(bus, motor_name, config, behavior)
+    stop_motor_motion(bus, motor_name)
+
+    use_physical_limit_range = motor.id in {1, 2, 3, 4, 5, 6}
+    if use_physical_limit_range:
+        physical_range_min, physical_range_max = unwrap_physical_limit_range(
+            limit_result.first_limit,
+            limit_result.second_limit,
+            behavior.second_direction,
+            SERVO_RESOLUTION,
+        )
+        total_offset = physical_range_max - physical_range_min
+        logger.info(
+            "Using physical limit range: "
+            f"motor_id={motor.id}, motor_name={motor_name}, "
+            f"first_limit={limit_result.first_limit}, second_limit={limit_result.second_limit}, "
+            f"unwrapped_range=[{physical_range_min}, {physical_range_max}]"
+        )
+    else:
+        total_offset = limit_result.second_offset
+
+    half_offset = total_offset // 2
+    half_offset += behavior.midpoint_half_offset_adjustment
+
+    logger.info(f"\nStep 3: total offset: {total_offset}")
+    if behavior.use_closed_position_as_center:
+        logger.info("Step 3: gripper maps physical open/closed limits directly and skips midpoint motion.")
+        actual_mid_physical = limit_result.first_limit
+        logger.info(
+            f"Gripper closed position: logical={limit_result.first_limit}, physical={actual_mid_physical}"
+        )
+    else:
+        move_motor_to_midpoint(bus, motor_name, config, behavior, half_offset)
+    stop_motor_motion(bus, motor_name)
+
+    target_center = max_position // 2
+
+    if behavior.use_closed_position_as_center:
+        raw_middle_offset = physical_range_min
+        ideal_offset = normalize_homing_offset(raw_middle_offset)
+        ideal_range_min = 0
+        ideal_range_max = total_offset
+        logger.info(
+            "Step 5: gripper logical range maps open to 0 and closed to 100: "
+            f"open_physical={physical_range_min}, closed_physical={physical_range_max}"
+        )
+    elif use_physical_limit_range:
+        physical_mid_unwrapped = physical_range_min + half_offset
+        actual_mid_physical = physical_mid_unwrapped % SERVO_RESOLUTION
+        raw_middle_offset = physical_mid_unwrapped - target_center
+        ideal_offset = normalize_homing_offset(raw_middle_offset)
+        ideal_range_min = target_center - half_offset
+        ideal_range_max = target_center + (total_offset - half_offset)
+    else:
+        physical_mid_unwrapped = limit_result.second_limit + half_offset
+        actual_mid_physical = physical_mid_unwrapped % SERVO_RESOLUTION
+        raw_middle_offset = physical_mid_unwrapped - target_center
+        ideal_offset = normalize_homing_offset(raw_middle_offset)
+        ideal_range_min = target_center - half_offset
+        ideal_range_max = target_center + (total_offset - half_offset)
+
+    ideal_range_min, ideal_range_max, ideal_offset = fold_unwrapped_range_to_single_turn(
+        ideal_range_min,
+        ideal_range_max,
+        ideal_offset,
+        max_position,
+    )
+    ideal_offset = normalize_homing_offset(ideal_offset)
+
+    if ideal_range_min < 0 or ideal_range_max > max_position:
+        raise ValueError(
+            "Calculated position limits fall outside the valid servo range: "
+            f"range_min={ideal_range_min}, range_max={ideal_range_max}, max_position={max_position}"
+        )
+
+    logger.info(f"Step 5: raw midpoint offset = {raw_middle_offset}")
+    logger.info(f"Step 5: final homing offset = {ideal_offset}")
+    logger.info(f"Step 6: logical range = [{ideal_range_min}, {ideal_range_max}]")
+
+    calibration = MotorCalibration(
+        id=motor.id,
+        drive_mode=0,
+        homing_offset=ideal_offset,
+        range_min=ideal_range_min,
+        range_max=ideal_range_max,
+    )
+
+    bus.write("Torque_Limit", motor_name, 1000, normalize=False)
+    bus.write("Protective_Torque", motor_name, 20, normalize=False)
+    bus.write("Protection_Time", motor_name, 200, normalize=False)
+    bus.write("Overload_Torque", motor_name, 80, normalize=False)
+    stop_motor_motion(bus, motor_name)
+
+    logger.info("\nCalibration complete.")
+    logger.info(f"  Motor ID: {motor.id}")
+    logger.info(f"  Homing Offset: {ideal_offset}")
+    logger.info(f"  Range Min: {ideal_range_min}")
+    logger.info(f"  Range Max: {ideal_range_max}")
+    logger.info("=" * 60)
+
+    return calibration
+
+
+def auto_calibrate_robot(
+    robot: CalibratableDevice,
+    config: AutoCalibrateConfig,
+) -> dict[str, MotorCalibration]:
+    """Auto calibrate every motor on a connected device."""
+
+    if not hasattr(robot, "bus") or not isinstance(robot.bus, FeetechMotorsBus):
+        raise ValueError("Auto calibration only supports devices backed by FeetechMotorsBus.")
+
+    bus = robot.bus
+    if not bus.is_connected:
+        raise RuntimeError("Motor bus is not connected. Connect the device before calibrating.")
+
+    plan = build_robot_calibration_plan(robot, list(bus.motors.keys()))
+    calibration_dict: dict[str, MotorCalibration] = {}
+
+    logger.info(f"Motors selected for calibration: {list(plan.recovery_order)}")
+    logger.info(f"Calibration order: {list(plan.ordered_motors)}")
+
+    for motor_name in plan.ordered_motors:
+        try:
+            wait_if_calibration_paused()
+            run_matching_actions(bus, motor_name, plan.pre_actions, config)
+            calibration = auto_calibrate_single_joint(bus, motor_name, config)
+            calibration_dict[motor_name] = calibration
+            sleep_with_pause(1.0)
+        except Exception as error:
+            logger.error(f"Failed while calibrating motor {motor_name}: {error}")
+            raise
+
+    for motor_name in plan.recovery_order:
+        try:
+            wait_if_calibration_paused()
+            run_matching_actions(bus, motor_name, plan.post_actions, config)
+        except Exception as error:
+            logger.error(f"Failed while recovering motor {motor_name}: {error}")
+            raise
+
+    logger.info("All joints recovered. Releasing torque before writing calibration registers.")
+    bus.disable_torque(list(plan.recovery_order))
+    bus.write_calibration(calibration_dict)
+
+    return calibration_dict
+
+
+def auto_calibrate_connected_device(
+    device: CalibratableDevice,
+    config: AutoCalibrateConfig,
+    *,
+    save: bool = True,
+    calibration_path: Path | str | None = None,
+) -> AutoCalibrateResult:
+    """Run calibration on an already connected device and optionally save the result."""
+
+    calibration_dict = auto_calibrate_robot(device, config)
+    saved_path: Path | None = None
+
+    if save:
+        saved_path = Path(calibration_path) if calibration_path is not None else Path(device.calibration_fpath)
+        save_calibration_to_file(calibration_dict, saved_path)
+
+    return AutoCalibrateResult(calibration_dict=calibration_dict, calibration_path=saved_path)
+
+
+def save_calibration_to_file(
+    calibration_dict: dict[str, MotorCalibration],
+    filepath: Path | str,
+):
+    """Persist calibration data to a JSON file."""
+
+    calibration_data = {}
+    for motor_name, calib in calibration_dict.items():
+        calibration_data[motor_name] = {
+            "id": calib.id,
+            "drive_mode": calib.drive_mode,
+            "homing_offset": calib.homing_offset,
+            "range_min": calib.range_min,
+            "range_max": calib.range_max,
+        }
+
+    filepath = Path(filepath)
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(filepath, "w", encoding="utf-8") as file:
+        json.dump(calibration_data, file, indent=2)
+
+    logger.info(f"Calibration data saved to: {filepath}")
+
+
+@draccus.wrap()
+def auto_calibrate(cfg: AutoCalibrateConfig):
+    """CLI entry point for robot auto calibration."""
+
+    init_logging()
+    logger.info("Starting auto calibration.")
+    logger.info(pformat(asdict(cfg)))
+    set_calibration_paused(False)
+
+    robot = make_robot_from_config(cfg.robot)
+    robot.connect(calibrate=False)
+
+    try:
+        result = auto_calibrate_connected_device(robot, cfg)
+        logger.info("\nAuto calibration finished successfully.")
+        if result.calibration_path is not None:
+            logger.info(f"Calibration file saved to: {result.calibration_path}")
+    except Exception as error:
+        logger.error(f"Auto calibration failed: {error}")
+        raise
+    finally:
+        robot.disconnect()
 
 
 def main():
