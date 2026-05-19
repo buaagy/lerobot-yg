@@ -1,17 +1,26 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 
-"""PyQt-based UI for SO auto calibration."""
+# Copyright 2024 The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
-from __future__ import annotations
+"""Auto calibration helpers for Feetech-based devices."""
 
-import glob
-import inspect
+import json
 import logging
-import os
-import subprocess
-import sys
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, field
+from enum import Enum
 from pathlib import Path
 from pprint import pformat
 from threading import Event
@@ -19,60 +28,16 @@ from typing import Protocol
 
 import draccus
 
-from lerobot.motors import auto_calibrate as auto_calibrate_module
-from lerobot.motors.feetech import OperatingMode
-from lerobot.robots import make_robot_from_config, so101_follower  # noqa: F401
-from lerobot.robots.so101_follower import SO101FollowerConfig
-from lerobot.teleoperators import make_teleoperator_from_config, so101_leader  # noqa: F401
-from lerobot.teleoperators.so101_leader import SO101LeaderConfig
-
-try:
-    from PyQt5.QtCore import QObject, QThread, QTimer, pyqtSignal as Signal
-    from PyQt5.QtGui import QColor, QFont, QTextCursor
-    from PyQt5.QtWidgets import (
-        QApplication,
-        QComboBox,
-        QFrame,
-        QGridLayout,
-        QGroupBox,
-        QHBoxLayout,
-        QInputDialog,
-        QLabel,
-        QLineEdit,
-        QMainWindow,
-        QMessageBox,
-        QPushButton,
-        QPlainTextEdit,
-        QSizePolicy,
-        QVBoxLayout,
-        QWidget,
-    )
-
-    QT_LIB = "PyQt5"
-except ImportError:
-    from PySide6.QtCore import QObject, QThread, QTimer, Signal
-    from PySide6.QtGui import QColor, QFont, QTextCursor
-    from PySide6.QtWidgets import (
-        QApplication,
-        QComboBox,
-        QFrame,
-        QGridLayout,
-        QGroupBox,
-        QHBoxLayout,
-        QInputDialog,
-        QLabel,
-        QLineEdit,
-        QMainWindow,
-        QMessageBox,
-        QPushButton,
-        QPlainTextEdit,
-        QSizePolicy,
-        QVBoxLayout,
-        QWidget,
-    )
-
-    QT_LIB = "PySide6"
-
+from lerobot.motors import MotorCalibration
+from lerobot.motors.feetech import FeetechMotorsBus, OperatingMode
+from lerobot.robots import (  # noqa: F401
+    Robot,
+    RobotConfig,
+    make_robot_from_config,
+    so100_follower,
+    so101_follower,
+)
+from lerobot.utils.utils import init_logging
 
 logger = logging.getLogger(__name__)
 _CALIBRATION_PAUSED = Event()
@@ -851,10 +816,7 @@ def auto_calibrate(cfg: AutoCalibrateConfig):
 
 
 def main():
-    app = QApplication(sys.argv)
-    window = AutoCalibrateWindow()
-    window.show()
-    sys.exit(app.exec())
+    auto_calibrate()
 
 
 if __name__ == "__main__":
