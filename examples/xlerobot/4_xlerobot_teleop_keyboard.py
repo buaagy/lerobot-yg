@@ -383,7 +383,7 @@ class SimpleTeleopArm:
 def main():
     # Teleop parameters
     FPS = 50
-    ip = "192.168.200.104"  # This is for zmq connection
+    ip = "192.168.200.31"  # This is for zmq connection
     #ip = "localhost"  # This is for local/wired connection
     robot_name = "joyandai_xlerobot1"
 
