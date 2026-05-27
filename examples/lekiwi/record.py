@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from lerobot.common.control_utils import init_keyboard_listener
+from lerobot.utils.control_utils import init_keyboard_listener
 from lerobot.datasets import LeRobotDataset
 from lerobot.processor import make_default_processors
 from lerobot.robots.lekiwi import LeKiwiClient, LeKiwiClientConfig, LeKiwi, LeKiwiConfig
@@ -42,13 +42,13 @@ def main():
     resume = args.resume 
 
     # Create the robot and teleoperator configurations
-    robot_config = LeKiwiClientConfig(remote_ip="192.168.31.165", id="LK12252710") # remote
+    robot_config = LeKiwiClientConfig(remote_ip="192.168.200.52", id="joyandai") # remote
     # robot_config = LeKiwiConfig(port="COM3",id="my_lekiwi")     # local
 
     # port in Linux: /dev/ttyACM0, /dev/ttyACM1, etc.
     # port in MacOS: /dev/tty.usbmodemXXXXXXXXXXXX
     # port in Windows: COMX / COMXX
-    leader_arm_config = SO101LeaderConfig(port="COM69", id="R07252710")
+    leader_arm_config = SO101LeaderConfig(port="COM10", id="my_so101")
     keyboard_config = KeyboardTeleopConfig()
 
     # Initialize the robot and teleoperator
